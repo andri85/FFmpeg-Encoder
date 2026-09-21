@@ -1,0 +1,6528 @@
+#!/usr/bin/env python3
+# FFmpeg Split GUI — naplex19 v1.2 AI Auto-Fix 15/09/2026
+#
+# Python 3 + FFmpeg/ffprobe in PATH.
+# Drag & Drop reale: richiede tkinterdnd2 (pip install tkinterdnd2).
+# Dipendenze opzionali (con fallback graceful):
+#   - send2trash  → cestino di sistema
+#   - plyer       → notifiche desktop
+#   - psutil      → monitor CPU/RAM
+#
+# CHANGELOG v1.1 + v1.1 (major):
+#   - GUI multi-tab con scrollbar verticale (4 tab)
+#   - Modalità split: size / durata fissa / N parti / capitoli
+#   - Auto-target preset: Telegram 2/4 GB, FAT32, DVD, custom
+#   - Rinomina parti personalizzabile
+#   - Trash / _TRASH folder invece di delete permanente
+#   - Preset nominati (max 5)
+#   - Progress reale (-progress pipe:1) con ETA/FPS/speed
+#   - Auto-workers + limite threads FFmpeg
+#   - Check spazio disco prima dell'avvio
+#   - Fallback NVENC → CPU automatico
+#   - Diagnostica sistema (encoder/filtri disponibili)
+#   - Log CSV + JSON dell'operazione
+#   - Export comandi come script .sh / .bat
+#   - Struttura Plex / Jellyfin / Kodi
+#   - Priorità processo FFmpeg (nice)
+#   - Retrocompatibile con settings v1.14
+# v1.1:
+#   - Coda job persistente + riordino + salvataggio/caricamento JSON
+#   - Resume delle parti completate e file queue di recovery
+#   - Verifica automatica output con ffprobe + SHA-256 opzionale
+#   - Retry automatico per job falliti
+#   - Pausa/ripresa tra le parti
+#   - Pre-flight check e Smart Encode
+#   - Analisi file e statistiche sessione
+#   - Protezione input: gestione post-process solo a verifica completa
+# v1.3:
+#   - FFmpeg Manager: PATH + percorsi statici Windows + percorso personalizzato
+#   - Console CMD nascosta durante ffmpeg/ffprobe su Windows
+#   - Tab Download FFmpeg con link al sito ufficiale
+#   - Rilevamento automatico ffmpeg/ffprobe e diagnostica percorso
+#   - Quick Media Info, pulizia temporanei e copia diagnostica
+#   - Impostazioni FFmpeg persistenti
+#   - Drag & Drop cross-platform con tkinterdnd2 (Windows + Linux/Arch)
+#   - Svuota lista coda + MAP/Stream Manager rapido nella dashboard
+
+import json
+import hashlib
+import uuid
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+# Drag & Drop cross-platform (Windows + Linux/Arch), opzionale con fallback graceful.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    TKDND_OK = True
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+    TKDND_OK = False
+
+# ---------- Dipendenze opzionali ----------
+try:
+    from send2trash import send2trash
+    SEND2TRASH_OK = True
+except ImportError:
+    SEND2TRASH_OK = False
+
+try:
+    from plyer import notification as plyer_notification
+    PLYER_OK = True
+except ImportError:
+    PLYER_OK = False
+
+try:
+    import psutil
+    PSUTIL_OK = True
+except ImportError:
+    PSUTIL_OK = False
+
+
+# =====================================================================
+# ===== COSTANTI GLOBALI ==============================================
+# =====================================================================
+THRESHOLD = 4 * 1024**3
+
+TARGET_OPTIONS = {
+    "2000 MB": 2000 * 1000**2,
+    "2500 MB": 2500 * 1000**2,
+    "3000 MB": 3000 * 1000**2,
+    "3500 MB": 3500 * 1000**2,
+    "4000 MB": 4000 * 1000**2,
+}
+
+# Auto-target: limite -> bytes (con margine di sicurezza)
+AUTO_TARGET_OPTIONS = {
+    "Custom (usa valore sopra)": None,
+    "Telegram Standard (1.95 GiB)": int(1.95 * 1024**3),
+    "Telegram Premium (3.95 GiB)":  int(3.95 * 1024**3),
+    "FAT32 (3.95 GiB)":             int(3.95 * 1024**3),
+    "DVD5 (4.36 GiB)":              int(4.36 * 1024**3),
+    "DVD9 (7.95 GiB)":              int(7.95 * 1024**3),
+    "Blu-ray (24 GiB)":             int(24 * 1024**3),
+    "Google Drive (4.9 GiB)":       int(4.9 * 1024**3),
+}
+
+VIDEO_EXT = {
+    ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts",
+    ".mts", ".webm", ".flv", ".wmv", ".mpg", ".mpeg", ".vob"
+}
+
+OUTPUT_EXT_OPTIONS = [
+    "Stessa del sorgente",
+    ".mkv", ".mp4", ".m4v", ".ts", ".mov", ".avi", ".webm",
+]
+
+CODEC_OPTIONS = {
+    "Copy (no re-encode)":            ("copy",       False, True),
+    "H.264 CPU (libx264)":            ("libx264",    False, False),
+    "H.265 CPU (libx265)":            ("libx265",    False, False),
+    "H.264 GPU NVIDIA (h264_nvenc)":  ("h264_nvenc", True,  False),
+    "H.265 GPU NVIDIA (hevc_nvenc)":  ("hevc_nvenc", True,  False),
+    "H.264 Intel QSV (h264_qsv)":     ("h264_qsv",   True,  False),
+    "H.265 Intel QSV (hevc_qsv)":     ("hevc_qsv",   True,  False),
+    "H.264 AMD AMF (h264_amf)":       ("h264_amf",   True,  False),
+    "H.265 AMD AMF (hevc_amf)":       ("hevc_amf",   True,  False),
+}
+
+# Fallback CPU per ogni GPU codec
+GPU_FALLBACK = {
+    "h264_nvenc": "libx264",
+    "hevc_nvenc": "libx265",
+    "h264_qsv":   "libx264",
+    "hevc_qsv":   "libx265",
+    "h264_amf":   "libx264",
+    "hevc_amf":   "libx265",
+}
+
+AUDIO_OPTIONS = {
+    "Copy (originale)":   ("copy",        None),
+    "Nessuno (-an)":      (None,          None),
+    "AAC":                ("aac",         None),
+    "AC3":                ("ac3",         None),
+    "E-AC3":              ("eac3",        None),
+    "MP3":                ("libmp3lame",  None),
+    "Opus":               ("libopus",     None),
+    "FLAC (lossless)":    ("flac",        None),
+}
+
+RESOLUTION_OPTIONS = {
+    "Originale":  None,
+    "2160p (4K)": 2160,
+    "1440p (2K)": 1440,
+    "1080p":      1080,
+    "720p":       720,
+    "480p":       480,
+    "360p":       360,
+}
+
+FPS_OPTIONS = {
+    "Originale": None,
+    "60":        60,
+    "50":        50,
+    "30":        30,
+    "25":        25,
+    "24":        24,
+    "23.976":    23.976,
+}
+
+SUBTITLE_OPTIONS = {
+    "Copia (default - infer_no_sub)": "copy",
+    "Nessuno":                        "none",
+    "Solo forzati":                   "forced_only",
+    "Escludi forzati":                "exclude_forced",
+    "Brucia nel video (burn-in)":     "burn",
+}
+
+# Modalità split
+SPLIT_MODE_OPTIONS = {
+    "Non splittare (file intero)": "none",
+    "Per dimensione (MB)":   "size",
+    "Per durata fissa":      "duration",
+    "In N parti uguali":     "parts",
+    "Per capitoli":          "chapters",
+}
+
+# Durata fissa: preset + custom
+DURATION_OPTIONS = {
+    "10 min":  600,
+    "15 min":  900,
+    "20 min":  1200,
+    "30 min":  1800,
+    "45 min":  2700,
+    "60 min":  3600,
+    "Custom (secondi)": None,
+}
+
+# N parti
+PARTS_OPTIONS = ["2", "3", "4", "5", "6", "8", "10"]
+
+# Struttura output
+FOLDER_STRUCTURE_OPTIONS = {
+    "Flat (Show/Season NN)":             "flat",
+    "Plex:  Show (Year)/Season NN/":     "plex",
+    "Jellyfin:  Show (Year)/Season NN/": "jellyfin",
+    "Kodi:  Show/Season NN/":            "kodi",
+    "Film:  Movie (Year)/":              "movie",
+}
+
+# Rinomina parti: template con placeholder
+RENAME_PART_OPTIONS = {
+    "Default: .part001":              "default",
+    "Part 01 of 05":                  "part_of_total",
+    "Show - SxxExx - Part N":         "tv_part",
+    "Numerico progressivo (1,2,3)":   "numeric",
+    "Custom (usa template sotto)":    "custom",
+}
+
+# Preset
+MAX_PRESETS = 5
+PRESET_FOLDER = Path.home() / ".ffmpeg_split_gui_presets"
+DEFAULT_SETTINGS_FILE = Path.home() / ".ffmpeg_split_gui.json"
+SETTINGS_VERSION = "1.2 AI"
+QUEUE_FILE = Path.home() / ".ffmpeg_split_gui_queue.json"
+QUEUE_VERSION = "1.2"
+
+# ---------- FFmpeg Manager ----------
+FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
+FFMPEG_CONFIGURED_PATH = ""
+
+def _windows_static_ffmpeg_candidates():
+    """Percorsi statici comuni per installazioni Windows di FFmpeg."""
+    candidates = []
+    if os.name == "nt":
+        candidates += [
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\ffmpeg\ffmpeg.exe"),
+            Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe"),
+            Path(os.environ.get("LOCALAPPDATA", "")) / "ffmpeg" / "bin" / "ffmpeg.exe",
+            Path(os.environ.get("USERPROFILE", "")) / "ffmpeg" / "bin" / "ffmpeg.exe",
+        ]
+    # Supporto anche per una cartella ffmpeg portatile accanto allo script/app.
+    try:
+        base = Path(sys.executable).resolve().parent
+        if base.name.lower() == "scripts":
+            base = base.parent
+        candidates += [
+            base / "ffmpeg" / "bin" / "ffmpeg.exe",
+            base / "ffmpeg" / "ffmpeg.exe",
+            Path.cwd() / "ffmpeg" / "bin" / "ffmpeg.exe",
+        ]
+    except Exception:
+        pass
+    return candidates
+
+def resolve_ffmpeg_tool(tool="ffmpeg"):
+    """
+    Risolve ffmpeg/ffprobe in questo ordine:
+      1) percorso configurato dall'utente;
+      2) PATH di sistema;
+      3) percorsi statici comuni.
+    """
+    exe = "ffmpeg.exe" if tool == "ffmpeg" and os.name == "nt" else tool
+    if tool == "ffprobe" and os.name == "nt":
+        exe = "ffprobe.exe"
+
+    configured = Path(FFMPEG_CONFIGURED_PATH).expanduser() if FFMPEG_CONFIGURED_PATH else None
+    if configured:
+        if configured.is_file():
+            # Se l'utente ha indicato ffmpeg.exe, deriva ffprobe.exe dalla stessa cartella.
+            if tool == "ffprobe" and configured.name.lower() == "ffmpeg.exe":
+                sibling = configured.with_name("ffprobe.exe")
+                if sibling.is_file():
+                    return str(sibling)
+            return str(configured)
+        if configured.is_dir():
+            candidate = configured / exe
+            if candidate.is_file():
+                return str(candidate)
+            # Se il percorso è la cartella radice di FFmpeg.
+            candidate = configured / "bin" / exe
+            if candidate.is_file():
+                return str(candidate)
+
+    found = shutil.which(exe) or shutil.which(tool)
+    if found:
+        return found
+
+    if tool in ("ffmpeg", "ffprobe"):
+        for ff in _windows_static_ffmpeg_candidates():
+            if ff.name.lower() == exe.lower() and ff.is_file():
+                return str(ff)
+            if tool == "ffprobe" and ff.name.lower() == "ffmpeg.exe":
+                sibling = ff.with_name("ffprobe.exe")
+                if sibling.is_file():
+                    return str(sibling)
+    return None
+
+def ffmpeg_available():
+    return bool(resolve_ffmpeg_tool("ffmpeg"))
+
+def ffprobe_available():
+    return bool(resolve_ffmpeg_tool("ffprobe"))
+
+def _subprocess_hidden_kwargs(process_group=False):
+    """Opzioni Popen comuni: console nascosta e gruppo di processo dedicato."""
+    kwargs = {}
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        if process_group:
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs["creationflags"] = flags
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
+    elif process_group:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _terminate_process_tree(proc, grace=1.5):
+    """Termina FFmpeg e tutti i suoi eventuali processi figli."""
+    if proc is None:
+        return True
+    try:
+        if proc.poll() is not None:
+            return True
+    except Exception:
+        return True
+
+    pid = getattr(proc, "pid", None)
+    try:
+        if os.name == "nt" and pid:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=max(2.0, grace + 1.0),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+        elif pid:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            deadline = time.time() + grace
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    return True
+                time.sleep(0.05)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        pass
+    return True
+GUI_THEMES = ["Bianco", "Sistema", "Chiaro", "Verde", "Contrasto"]
+
+# Palette minima disponibile durante la costruzione iniziale della GUI.
+# I metodi di costruzione usano questa variabile prima di apply_theme().
+pal = {"fg": "#111111", "bg": "#ffffff", "panel": "#f5f5f5", "panel2": "#eeeeee", "field": "#ffffff", "muted": "#333333", "border": "#cccccc", "accent": "#e8e8e8", "accent2": "#d8d8d8", "yellow": "#111111", "green": "#111111", "danger": "#cc0000", "select": "#d9d9d9"}
+
+SMART_PROFILES = {
+    "Smart": {"description": "Sceglie conservativamente copy/codec in base al sorgente."},
+    "Archivio": {"description": "H.265 CPU, qualità alta, audio originale, verifica."},
+    "Velocità": {"description": "Preset rapido, privilegiando il tempo di elaborazione."},
+    "TV": {"description": "H.264 1080p, yuv420p, audio AAC."},
+    "Compressione": {"description": "H.265 con CRF orientato alla riduzione dimensioni."},
+}
+
+# Encoding speed preset
+PRESET_ENCODER_OPTIONS = ["ultrafast", "superfast", "veryfast",
+                          "faster", "fast", "medium", "slow", "slower", "veryslow"]
+NVENC_PRESET_OPTIONS = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
+
+# Tune options (x264/x265)
+TUNE_OPTIONS = ["(nessuno)", "film", "animation", "grain", "stillimage",
+                "fastdecode", "zerolatency"]
+
+# Threads
+THREADS_OPTIONS = ["Auto", "1", "2", "4", "6", "8", "12", "16", "24", "32"]
+
+# Priorità processo
+PRIORITY_OPTIONS = ["Normale", "Sotto la norma", "Bassa", "Idle"]
+
+# Log CSV
+LOG_CSV_HEADER = [
+    "timestamp", "input_file", "output_file", "part_num", "total_parts",
+    "duration_sec", "size_bytes", "codec_video", "codec_audio",
+    "resolution", "fps", "split_mode", "status", "verified",
+    "sha256", "elapsed_sec", "speed", "error"
+]
+
+
+# =====================================================================
+# ===== FFMPEG ERROR DIAGNOSTICS ======================================
+# =====================================================================
+FFMPEG_ERROR_PATTERNS = [
+    (r"Unknown encoder '([^']+)'", "CODEC MANCANTE",
+     "Il codec richiesto non è disponibile in questa build di FFmpeg.",
+     "Installa una build completa (gyan.dev o BtbN) o scegli un codec diverso."),
+    (r"Unknown decoder '([^']+)'", "DECODER MANCANTE",
+     "Il decoder per il flusso sorgente non è disponibile.",
+     "Aggiorna FFmpeg o usa 'Copy' se il file è già compatibile."),
+    (r"Cannot load nvcuda\.dll|Cannot load nvEncodeAPI|No NVENC capable devices found",
+     "NVENC NON DISPONIBILE",
+     "La GPU NVIDIA o i driver NVENC non sono accessibili.",
+     "Verifica driver NVIDIA aggiornati. In alternativa usa libx264/libx265."),
+    (r"OpenEncodeSessionEx failed|out of memory|OutOfMemory",
+     "MEMORIA GPU ESAURITA",
+     "La GPU non ha abbastanza memoria per la sessione di encoding.",
+     "Riduci workers paralleli, risoluzione, o cambia codec."),
+    (r"No such file or directory", "FILE NON TROVATO",
+     "Il file di input o il percorso di output non esiste.",
+     "Controlla che il file sorgente esista e che la cartella sia accessibile."),
+    (r"Permission denied", "PERMESSI NEGATI",
+     "Non hai i permessi per scrivere nella cartella di output.",
+     "Cambia cartella di output o esegui con permessi adeguati."),
+    (r"No space left on device|Disk full", "SPAZIO DISCO INSUFFICIENTE",
+     "Il disco di destinazione è pieno.",
+     "Libera spazio o scegli un'altra cartella di output."),
+    (r"Invalid data found when processing input|moov atom not found|"
+     r"could not find codec parameters|Error while decoding",
+     "FILE CORROTTO O INCOMPLETO",
+     "Il file sorgente è danneggiato o il formato non è supportato.",
+     "Verifica con 'ffprobe' o riprova a scaricarlo/copiarlo."),
+    (r"Conversion failed!|Error initializing|"
+     r"Error opening output file|Error writing trailer",
+     "ERRORE GENERICO DI SCRITTURA",
+     "FFmpeg non è riuscito a completare la conversione.",
+     "Controlla i dettagli dello stderr mostrati sopra."),
+    (r"Could not write header|muxer does not support",
+     "MUXER NON SUPPORTA IL CODEC",
+     "Il container di output non supporta uno dei codec scelti.",
+     "Usa .mkv (più permissivo) o cambia codec."),
+    (r"Invalid argument|Invalid setting|Error setting option|Option .* not found",
+     "PARAMETRO NON VALIDO",
+     "Uno dei parametri passati a FFmpeg non è supportato.",
+     "Riduci bitrate/preset o verifica il codec scelto."),
+    (r"Subtitle.*not found|Unable to open.*subtitle|Error opening filters|No such filter",
+     "ERRORE SOTTOTITOLI/FILTRI",
+     "Il filtro sottotitoli non è disponibile o il file sub non è accessibile.",
+     "Disattiva burn-in o verifica che libass sia incluso."),
+    (r"Non-monotonous DTS|Non-monotonic DTS|Timestamps are unset|PTS .* out of order",
+     "TIMESTAMP ANOMALI",
+     "I timestamp del flusso sono incoerenti (comune con stream copy).",
+     "Usa '-avoid_negative_ts make_zero' o ricodifica il video."),
+    (r"deprecated pixel format|pixel format .* is not supported",
+     "PIXEL FORMAT NON SUPPORTATO",
+     "Il pixel format sorgente non è compatibile con il codec scelto.",
+     "Aggiungi '-pix_fmt yuv420p' o ricodifica con codec CPU."),
+]
+
+
+def diagnose_ffmpeg_error(stderr_text):
+    found = []
+    seen = set()
+    for pattern, cat, expl, hint in FFMPEG_ERROR_PATTERNS:
+        if re.search(pattern, stderr_text, re.IGNORECASE):
+            if cat in seen:
+                continue
+            seen.add(cat)
+            found.append((cat, expl, hint))
+    return found
+
+
+def last_stderr_lines(stderr_text, n=30):
+    lines = [ln for ln in stderr_text.splitlines() if ln.strip()]
+    return lines[-n:]
+
+
+# =====================================================================
+# ===== HELPERS PROCESSO ==============================================
+# =====================================================================
+def run(cmd, timeout=None):
+    try:
+        cmd = list(cmd)
+        if cmd:
+            base = Path(str(cmd[0])).name.lower()
+            if base in ("ffmpeg", "ffmpeg.exe"):
+                resolved = resolve_ffmpeg_tool("ffmpeg")
+                if resolved:
+                    cmd[0] = resolved
+            elif base in ("ffprobe", "ffprobe.exe"):
+                resolved = resolve_ffmpeg_tool("ffprobe")
+                if resolved:
+                    cmd[0] = resolved
+        p = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            **_subprocess_hidden_kwargs()
+        )
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", f"Timeout dopo {timeout}s"
+
+
+def run_ffmpeg_with_progress(cmd, duration, progress_cb=None, cancel_event=None,
+                            process_register=None, process_unregister=None):
+    """Esegue FFmpeg con progress live e annullamento a livello di process tree."""
+    if cmd and cmd[0] == "ffmpeg":
+        cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + list(cmd[1:])
+
+    t0 = time.time()
+    try:
+        cmd = list(cmd)
+        if cmd:
+            base = Path(str(cmd[0])).name.lower()
+            if base in ("ffmpeg", "ffmpeg.exe"):
+                resolved = resolve_ffmpeg_tool("ffmpeg")
+                if resolved:
+                    cmd[0] = resolved
+            elif base in ("ffprobe", "ffprobe.exe"):
+                resolved = resolve_ffmpeg_tool("ffprobe")
+                if resolved:
+                    cmd[0] = resolved
+        p = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            **_subprocess_hidden_kwargs(process_group=True)
+        )
+        if process_register:
+            process_register(p)
+    except Exception as e:
+        return -1, f"Popen failed: {e}", 0.0
+
+    stderr_chunks = []
+    cancelled = False
+
+    def read_stderr():
+        try:
+            for line in p.stderr:
+                stderr_chunks.append(line)
+        except Exception:
+            pass
+
+    def read_stdout():
+        out_time_ms = 0
+        speed = ""
+        fps = ""
+        try:
+            for line in p.stdout:
+                line = line.strip()
+                if line.startswith("out_time_ms="):
+                    try:
+                        out_time_ms = int(line.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                    if duration > 0 and progress_cb:
+                        pct = min(100.0, out_time_ms / 1_000_000 / duration * 100.0)
+                        progress_cb(pct, out_time_ms / 1_000_000, speed, fps)
+                elif line.startswith("speed="):
+                    speed = line.split("=", 1)[1]
+                elif line.startswith("fps="):
+                    fps = line.split("=", 1)[1]
+                elif line.startswith("progress=") and line.endswith("end"):
+                    if progress_cb:
+                        progress_cb(100.0, duration, speed, fps)
+        except Exception:
+            pass
+
+    def watch_cancel():
+        nonlocal cancelled
+        if cancel_event is None:
+            return
+        try:
+            cancel_event.wait()
+            if cancel_event.is_set() and p.poll() is None:
+                cancelled = True
+                _terminate_process_tree(p)
+        except Exception:
+            pass
+
+    t_err = threading.Thread(target=read_stderr, daemon=True, name="FFmpegStderr")
+    t_out = threading.Thread(target=read_stdout, daemon=True, name="FFmpegProgress")
+    t_cancel = threading.Thread(target=watch_cancel, daemon=True, name="FFmpegCancelWatch")
+    t_err.start(); t_out.start(); t_cancel.start()
+
+    try:
+        rc = p.wait()
+    except Exception:
+        _terminate_process_tree(p)
+        rc = p.returncode if p.returncode is not None else -1
+
+    if cancel_event is not None and cancel_event.is_set():
+        cancelled = True
+        if p.poll() is None:
+            _terminate_process_tree(p)
+
+    t_err.join(timeout=2.0)
+    t_out.join(timeout=2.0)
+    elapsed = time.time() - t0
+    if process_unregister:
+        try:
+            process_unregister(p)
+        except Exception:
+            pass
+    if cancelled:
+        rc = -2
+    return rc, "".join(stderr_chunks), elapsed
+
+
+def ffprobe(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries",
+        "format=duration:format_tags=title:"
+        "format=size:"
+        "chapter=start_time:chapter=end_time:chapter_tags=title:"
+        "stream=index,codec_type,codec_name,width,height,r_frame_rate,"
+        "disposition,color_transfer,color_primaries",
+        "-show_chapters",
+        "-show_streams", "-of", "json", str(path)
+    ]
+    rc, out, err = run(cmd)
+    if rc:
+        raise RuntimeError(err.strip() or "ffprobe error")
+    return json.loads(out)
+
+
+def title_from_info(info):
+    return (info.get("format", {}).get("tags", {}) or {}).get("title", "")
+
+
+def seconds(x):
+    return f"{max(0.001, x):.6f}"
+
+
+def size_text(n):
+    if n >= 1024**4:
+        return f"{n / 1024**4:.2f} TiB"
+    if n >= 1024**3:
+        return f"{n / 1024**3:.2f} GiB"
+    return f"{n / 1000**2:.1f} MB"
+
+
+def has_subtitles(info):
+    return any(s.get("codec_type") == "subtitles" for s in info.get("streams", []))
+
+
+def subtitle_streams(info):
+    return [s for s in info.get("streams", []) if s.get("codec_type") == "subtitles"]
+
+
+def is_forced(sub_stream):
+    return (sub_stream.get("disposition", {}) or {}).get("forced", 0) == 1
+
+
+def is_hdr(info):
+    """True se almeno uno stream video è HDR (PQ o HLG)."""
+    for s in info.get("streams", []):
+        if s.get("codec_type") != "video":
+            continue
+        ct = (s.get("color_transfer") or "").lower()
+        if ct in ("smpte2084", "arib-std-b67"):
+            return True
+    return False
+
+
+def get_chapters(info):
+    """Ritorna lista di (start, end, title) dai capitoli, o [] se assenti."""
+    out = []
+    for ch in info.get("chapters", []) or []:
+        try:
+            st = float(ch.get("start_time", 0))
+            en = float(ch.get("end_time", 0))
+        except (TypeError, ValueError):
+            continue
+        title = (ch.get("tags", {}) or {}).get("title", "") or ""
+        if en > st:
+            out.append((st, en, title))
+    return out
+
+
+def escape_for_subtitles_filter(path):
+    s = str(path)
+    s = s.replace("\\", "\\\\")
+    s = s.replace(":", "\\:")
+    s = s.replace("'", "\\'")
+    s = s.replace("[", "\\[")
+    s = s.replace("]", "\\]")
+    return s
+
+
+def parse_extra_args(text):
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError as e:
+        raise ValueError(f"Argomenti extra non validi (quoting errato): {e}")
+
+
+# =====================================================================
+# ===== PARSING NOME FILE PER SERIE TV ================================
+# =====================================================================
+_RE_TV_A = re.compile(
+    r"^\s*(?P<show>.+?)"
+    r"(?:\s*\((?P<year>\d{4})\))?"
+    r"\s*[-._ ]+\s*"
+    r"[Ss](?P<season>\d{1,2})"
+    r"[Ee](?P<episode>\d{1,3})"
+    r"(?:\D.*)?$",
+    re.IGNORECASE,
+)
+_RE_TV_B = re.compile(
+    r"^\s*(?P<show>.+?)"
+    r"(?:\s*\((?P<year>\d{4})\))?"
+    r"\s+"
+    r"[Ss](?P<season>\d{1,2})"
+    r"[Ee](?P<episode>\d{1,3})"
+    r"(?:\D.*)?$",
+    re.IGNORECASE,
+)
+_RE_TV_C = re.compile(
+    r"^\s*(?P<show>.+?)"
+    r"(?:\s*\((?P<year>\d{4})\))?"
+    r"\s*[-._ ]+\s*"
+    r"(?P<season>\d{1,2})"
+    r"[xX]"
+    r"(?P<episode>\d{1,3})"
+    r"(?:\D.*)?$",
+    re.IGNORECASE,
+)
+_RE_TV_D = re.compile(
+    r"^\s*(?P<show>.+?)"
+    r"(?:\s*\((?P<year>\d{4})\))?"
+    r"\s+"
+    r"(?P<season>\d{1,2})"
+    r"[xX]"
+    r"(?P<episode>\d{1,3})"
+    r"(?:\D.*)?$",
+    re.IGNORECASE,
+)
+# Film: "Nome (Anno)" senza SxxExx
+_RE_MOVIE = re.compile(
+    r"^\s*(?P<title>.+?)\s*\((?P<year>\d{4})\)"
+    r"(?:\s*[-._ ].*)?$",
+    re.IGNORECASE,
+)
+
+
+def parse_tv_filename(name):
+    stem = Path(name).stem.strip()
+    for regex in (_RE_TV_A, _RE_TV_B, _RE_TV_C, _RE_TV_D):
+        m = regex.match(stem)
+        if not m:
+            continue
+        show = (m.group("show") or "").strip(" .-_")
+        if not show:
+            continue
+        year = m.group("year")
+        try:
+            season = int(m.group("season"))
+            episode = int(m.group("episode"))
+        except (TypeError, ValueError):
+            continue
+        return {
+            "is_tv": True,
+            "show": show,
+            "year": int(year) if year else None,
+            "season": season,
+            "episode": episode,
+        }
+    return {"is_tv": False}
+
+
+def parse_movie_filename(name):
+    stem = Path(name).stem.strip()
+    m = _RE_MOVIE.match(stem)
+    if not m:
+        return {"is_movie": False}
+    title = (m.group("title") or "").strip(" .-_")
+    if not title:
+        return {"is_movie": False}
+    try:
+        year = int(m.group("year"))
+    except (TypeError, ValueError):
+        return {"is_movie": False}
+    return {"is_movie": True, "title": title, "year": year}
+
+
+def sanitize_path_component(s):
+    s = str(s).strip()
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", s)
+    s = s.rstrip(" .")
+    return s or "_"
+
+
+def build_series_path(base_dir, parsed, fallback_stem, structure="flat"):
+    """
+    Costruisce il percorso di output per serie TV o film.
+    structure:
+      'flat'      -> Show (Year)/Season NN/
+      'plex'      -> Show (Year)/Season NN/
+      'jellyfin'  -> Show (Year)/Season NN/
+      'kodi'      -> Show/Season NN/
+      'movie'     -> Movie (Year)/
+    """
+    base_dir = Path(base_dir)
+
+    if parsed.get("is_tv"):
+        show = sanitize_path_component(parsed["show"])
+        year = parsed.get("year")
+        season = parsed["season"]
+        if structure == "kodi":
+            show_folder = show
+        else:
+            show_folder = f"{show} ({year})" if year else show
+        season_folder = f"Season {season:02d}"
+        return base_dir / show_folder / season_folder, "tv"
+
+    if parsed.get("is_movie"):
+        title = sanitize_path_component(parsed["title"])
+        year = parsed.get("year")
+        movie_folder = f"{title} ({year})" if year else title
+        return base_dir / movie_folder, "movie"
+
+    return base_dir / sanitize_path_component(fallback_stem), "flat"
+
+
+# =====================================================================
+# ===== UTILITY DISCO, NOTIFICHE, TRASH ===============================
+# =====================================================================
+def check_disk_space(path, needed_bytes):
+    """Ritorna (ok, free_bytes)."""
+    try:
+        usage = shutil.disk_usage(str(path))
+        return usage.free >= needed_bytes, usage.free
+    except Exception:
+        return True, -1
+
+
+def send_to_trash(path):
+    """Sposta nel cestino di sistema se disponibile, altrimenti in _TRASH."""
+    p = Path(path)
+    if SEND2TRASH_OK:
+        try:
+            send2trash(str(p))
+            return True, "cestino di sistema"
+        except Exception:
+            pass
+    try:
+        trash_dir = p.parent / "_TRASH"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        target = trash_dir / p.name
+        # Evita collisioni
+        if target.exists():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target = trash_dir / f"{p.stem}_{ts}{p.suffix}"
+        shutil.move(str(p), str(target))
+        return True, f"_TRASH ({target})"
+    except Exception as e:
+        return False, str(e)
+
+
+def notify(title, message):
+    """Notifica desktop se plyer è disponibile, altrimenti stampa."""
+    if PLYER_OK:
+        try:
+            plyer_notification.notify(
+                title=title, message=message, timeout=8
+            )
+            return
+        except Exception:
+            pass
+    print(f"[NOTIFICA] {title}: {message}", file=sys.stderr)
+
+
+def set_process_priority(pid, priority_label):
+    """Imposta la priorità del processo (best effort)."""
+    try:
+        if not PSUTIL_OK:
+            return False
+        p = psutil.Process(pid)
+        mapping = {
+            "Normale":         getattr(psutil, "NORMAL_PRIORITY_CLASS", None) if os.name == "nt" else 0,
+            "Sotto la norma":  getattr(psutil, "BELOW_NORMAL_PRIORITY_CLASS", None) if os.name == "nt" else 5,
+            "Bassa":           getattr(psutil, "IDLE_PRIORITY_CLASS", None) if os.name == "nt" else 10,
+            "Idle":            getattr(psutil, "IDLE_PRIORITY_CLASS", None) if os.name == "nt" else 19,
+        }
+        val = mapping.get(priority_label)
+        if val is None:
+            return False
+        if os.name == "nt":
+            p.nice(val)
+        else:
+            p.nice(val)
+        return True
+    except Exception:
+        return False
+
+
+def get_cpu_count():
+    try:
+        if PSUTIL_OK:
+            return psutil.cpu_count(logical=True) or os.cpu_count() or 1
+        return os.cpu_count() or 1
+    except Exception:
+        return 1
+
+
+# =====================================================================
+# ===== SCROLLABLE FRAME ==============================================
+# =====================================================================
+class ScrollableFrame(ttk.Frame):
+    """
+    Frame con scrollbar verticale (e orizzontale se serve).
+    Uso: usare self.inner come genitore per i widget.
+    """
+    def __init__(self, parent, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vsb.set,
+                              xscrollcommand=self.hsb.set)
+
+        self.vsb.pack(side="right", fill="y")
+        self.hsb.pack(side="bottom", fill="x")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.canvas_window = self.canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw"
+        )
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel_linux, add="+")
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel_linux, add="+")
+
+    def _on_inner_configure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        # Solo se il mouse è sopra questo canvas
+        try:
+            x, y = self.canvas.winfo_pointerxy()
+            widget = self.canvas.winfo_containing(x, y)
+            if widget is None:
+                return
+            w = widget
+            while w is not None:
+                if w is self.canvas or w is self.inner:
+                    break
+                w = w.master
+            else:
+                return
+            delta = -1 * (event.delta // 120) if event.delta else 0
+            self.canvas.yview_scroll(delta, "units")
+        except Exception:
+            pass
+
+    def _on_mousewheel_linux(self, event):
+        try:
+            x, y = self.canvas.winfo_pointerxy()
+            widget = self.canvas.winfo_containing(x, y)
+            if widget is None:
+                return
+            w = widget
+            while w is not None:
+                if w is self.canvas or w is self.inner:
+                    break
+                w = w.master
+            else:
+                return
+            if event.num == 4:
+                self.canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.canvas.yview_scroll(1, "units")
+        except Exception:
+            pass
+
+
+# =====================================================================
+# ===== CLASSE PRINCIPALE =============================================
+# =====================================================================
+class App(TkinterDnD.Tk if TKDND_OK else tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"FFmpeg GUI Ultimate v1.2 AI by naplex 19 — {datetime.now().strftime('%d/%m/%Y')}")
+        self.geometry("1340x900")
+        self.minsize(1180, 780)
+
+        # ---------- Variabili GUI: SORGENTE & OUTPUT ----------
+        self.folder = tk.StringVar()
+        self.output = tk.StringVar()
+        self.output_dirs = []
+        self.recursive = tk.BooleanVar(value=True)
+        self.only_over_4gib = tk.BooleanVar(value=False)
+        self.smart_tv_paths = tk.BooleanVar(value=True)
+        self.detect_movies = tk.BooleanVar(value=True)
+        self.folder_structure_var = tk.StringVar(value=list(FOLDER_STRUCTURE_OPTIONS)[0])
+        self.theme_var = tk.StringVar(value="Bianco")
+
+        # ---------- FFmpeg Manager ----------
+        self.ffmpeg_path_var = tk.StringVar(value="")
+        self.ffmpeg_status_var = tk.StringVar(value="Rilevamento automatico…")
+        self.ffmpeg_autodetect = tk.BooleanVar(value=True)
+        self.dnd_status_var = tk.StringVar(value="Drag & Drop: attivo" if TKDND_OK else "Drag & Drop: installa tkinterdnd2")
+
+        # ---------- Variabili: SPLIT MODE ----------
+        self.split_mode_var = tk.StringVar(value="Non splittare (file intero)")
+        self.target_var = tk.StringVar(value="2500 MB")
+        self.auto_target_var = tk.StringVar(value="Custom (usa valore sopra)")
+        self.custom_target_mb_var = tk.IntVar(value=2500)
+        self.duration_var = tk.StringVar(value="30 min")
+        self.custom_duration_sec_var = tk.IntVar(value=1800)
+        self.parts_n_var = tk.StringVar(value="2")
+
+        # ---------- Video ----------
+        self.codec_var = tk.StringVar(value="Copy (no re-encode)")
+        self.encoder_preset_var = tk.StringVar(value="veryfast")
+        self.nvenc_preset_var = tk.StringVar(value="p4")
+        self.tune_var = tk.StringVar(value="(nessuno)")
+        self.resolution_var = tk.StringVar(value="Originale")
+        self.fps_var = tk.StringVar(value="Originale")
+        self.video_br_var = tk.StringVar(value="0")
+        self.video_br_label = tk.StringVar(value="Auto (CRF/CQ)")
+        self.crf_var = tk.IntVar(value=21)
+        self.denoise = tk.BooleanVar(value=False)
+        self.deinterlace = tk.BooleanVar(value=False)
+        self.hdr_tonemap = tk.BooleanVar(value=False)
+
+        # ---------- Audio ----------
+        self.audio_var = tk.StringVar(value="Copy (originale)")
+        self.audio_br_var = tk.StringVar(value="0")
+        self.audio_br_label = tk.StringVar(value="Auto (default codec)")
+        self.loudnorm = tk.BooleanVar(value=False)
+
+        # ---------- Sottotitoli ----------
+        self.subtitle_var = tk.StringVar(value="Copia (default - infer_no_sub)")
+        self.infer_no_sub = tk.BooleanVar(value=True)
+
+        # ---------- Gestione MAP / stream ----------
+        # Se configurata, questa lista controlla esattamente quali stream
+        # vengono passati a FFmpeg con -map. Se vuota, resta il comportamento
+        # automatico originale.
+        self.map_streams = {}
+        self.map_source = None
+        self.map_tree = None
+        self.map_status_var = tk.StringVar(value="Seleziona un file e carica gli stream")
+
+        # ---------- Estensione output ----------
+        self.output_ext_var = tk.StringVar(value="Stessa del sorgente")
+
+        # ---------- Opzioni file ----------
+        self.overwrite = tk.BooleanVar(value=False)
+        self.skip_existing = tk.BooleanVar(value=True)
+        self.use_filename_as_title = tk.BooleanVar(value=True)
+        self.copy_metadata = tk.BooleanVar(value=True)
+        # ---------- Metadata statici / Logo overlay ----------
+        self.static_title_var = tk.StringVar(value="")
+        self.static_artist_var = tk.StringVar(value="")
+        self.static_album_var = tk.StringVar(value="")
+        self.static_genre_var = tk.StringVar(value="")
+        self.static_comment_var = tk.StringVar(value="")
+        self.static_year_var = tk.StringVar(value="")
+        self.static_logo_enabled = tk.BooleanVar(value=False)
+        self.static_logo_path = tk.StringVar(value="")
+        self.static_logo_position = tk.StringVar(value="In alto a destra")
+        self.static_logo_size = tk.IntVar(value=12)
+        self.static_logo_opacity = tk.IntVar(value=100)
+        self.opt_pix_fmt_yuv420p = tk.BooleanVar(value=False)
+        self.opt_movflags_faststart = tk.BooleanVar(value=False)
+
+        # ---------- Trash / delete ----------
+        self.delete_input_after = tk.BooleanVar(value=False)
+        self.delete_mode_var = tk.StringVar(value="Sposta in _TRASH")
+        self.custom_trash_dir = tk.StringVar(value="")
+
+        # ---------- Workers / performance ----------
+        self.auto_workers = tk.BooleanVar(value=False)
+        self.parallel_workers = tk.IntVar(value=1)
+        self.threads_var = tk.StringVar(value="Auto")
+        self.priority_var = tk.StringVar(value="Normale")
+        self.fallback_nvenc = tk.BooleanVar(value=True)
+        self.check_disk_space = tk.BooleanVar(value=True)
+
+        # ---------- Rinomina parti ----------
+        self.rename_part_var = tk.StringVar(value=list(RENAME_PART_OPTIONS)[0])
+        self.rename_custom_template = tk.StringVar(value="")
+
+        # ---------- Extra FFmpeg ----------
+        self.extra_args_text = None
+        self.extra_args_var = tk.StringVar(value="")
+
+        # ---------- Log ----------
+        self.save_log_csv = tk.BooleanVar(value=True)
+        self.save_log_json = tk.BooleanVar(value=False)
+        self.notify_desktop = tk.BooleanVar(value=PLYER_OK)
+
+        # ---------- Diagnostica cache ----------
+        self._ffmpeg_encoders = None
+        self._ffmpeg_filters = None
+
+        # ---------- AI Auto-Fix / Self-Healing Engine ----------
+        self.ai_enabled = tk.BooleanVar(value=True)
+        self.ai_auto_retry = tk.BooleanVar(value=True)
+        self.ai_auto_config = tk.BooleanVar(value=True)
+        self.ai_safe_mode = tk.BooleanVar(value=True)
+        self.ai_last_error = {}
+        self.ai_history = []
+        self.ai_source_backup = None
+        self.ai_fix_count = 0
+
+        # ---------- Stato runtime ----------
+        self.running = False
+        self.cancel_event = threading.Event()
+        self._ffmpeg_processes = set()
+        self._ffmpeg_process_lock = threading.RLock()
+        self.current_progress = tk.DoubleVar(value=0)
+        self.current_speed = tk.StringVar(value="—")
+        self.current_eta = tk.StringVar(value="—")
+        self.current_file = tk.StringVar(value="—")
+        # Monitor risorse live durante encoding: CPU / GPU / RAM.
+        self.cpu_usage_var = tk.StringVar(value="CPU: —")
+        self.gpu_usage_var = tk.StringVar(value="GPU: —")
+        self.ram_usage_var = tk.StringVar(value="RAM: —")
+        self._resource_monitor_stop = threading.Event()
+        self._resource_monitor_thread = None
+        self._resource_monitor_lock = threading.Lock()
+        self._gpu_query_cache = None
+        self._output_lock = threading.Lock()
+        self._output_rr_index = 0
+
+        self._ok_count = 0
+        self._err_count = 0
+
+        # ---------- Log CSV ----------
+        self.log_rows = []
+        self.log_lock = threading.Lock()
+
+        # ---------- Persistenza / preset ----------
+        self.autoload_settings = tk.BooleanVar(value=True)
+        self.autosave_settings = tk.BooleanVar(value=True)
+        # Gestione avanzata impostazioni generali
+        self.settings_status_var = tk.StringVar(value="Impostazioni: pronte")
+        self.settings_auto_backup = tk.BooleanVar(value=True)
+        self.settings_validate_on_apply = tk.BooleanVar(value=True)
+        self.preset_name_var = tk.StringVar(value="")
+
+        # ---------- v1.1: coda / resume / verifica / smart ----------
+        self.queue_jobs = {}
+        self.queue_order = []
+        self.queue_lock = threading.Lock()
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+        self.resume_enabled = tk.BooleanVar(value=True)
+        self.verify_output = tk.BooleanVar(value=True)
+        self.verify_duration_tolerance = tk.DoubleVar(value=3.0)
+        self.retry_enabled = tk.BooleanVar(value=True)
+        self.max_retries = tk.IntVar(value=2)
+        self.smart_encode = tk.BooleanVar(value=False)
+        self.smart_profile_var = tk.StringVar(value="Smart")
+        self.preferred_languages_var = tk.StringVar(value="ita,eng")
+        self.generate_hash = tk.BooleanVar(value=False)
+        self.protect_input = tk.BooleanVar(value=True)
+        self.auto_start_queue = tk.BooleanVar(value=False)
+        self._active_job_source = None
+        self._session_started = None
+        self._session_input_bytes = 0
+        self._session_output_bytes = 0
+        self._session_parts = 0
+        self._session_verified = 0
+        self._session_lock = threading.Lock()
+
+        # ---------- Costruzione UI ----------
+        self.build_ui()
+        self._initialize_drag_drop()
+        self._initialize_ffmpeg_manager()
+        self.apply_theme()
+        self.on_codec_change()
+        self.on_audio_change()
+        self.on_split_mode_change()
+
+        self.log.tag_configure("err", foreground="#ffd21f")
+        self.log.tag_configure("warn", foreground="#ffd21f")
+        self.log.tag_configure("ok", foreground="#ffd21f")
+        self.log.tag_configure("info", foreground="#ffd21f")
+        self.log.tag_configure("head", foreground=pal["fg"],
+                               font=("TkDefaultFont", 10, "bold"))
+
+        # Autoload impostazioni
+        if self.autoload_settings.get() and DEFAULT_SETTINGS_FILE.exists():
+            try:
+                self.load_settings(DEFAULT_SETTINGS_FILE, silent=True)
+                self.logmsg(
+                    f"✓ Impostazioni caricate da {DEFAULT_SETTINGS_FILE}", "ok"
+                )
+            except Exception as e:
+                self.logmsg(f"⚠ Autoload fallito: {e}", "warn")
+
+        # Recovery queue automatica v1.1
+        if self.resume_enabled.get() and QUEUE_FILE.exists():
+            if self.load_queue_file_silent():
+                self.logmsg(f"↻ Recovery queue caricata da {QUEUE_FILE}", "info")
+
+        # Benvenuto
+        self.logmsg(f"Naplex Prime — FFmpeg GUI Ultimate v{SETTINGS_VERSION}", "head")
+        self.logmsg(
+            f"Dipendenze opzionali: send2trash={SEND2TRASH_OK}, "
+            f"plyer={PLYER_OK}, psutil={PSUTIL_OK}", "info"
+        )
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # =================================================================
+    # ===== BUILD UI (4 TAB + SCROLLBAR) ==============================
+    # =================================================================
+    def _create_naplex_icon(self):
+        """Crea un'icona Naplex Prime con fulmine giallo senza file esterni."""
+        try:
+            icon = tk.PhotoImage(width=32, height=32)
+            bg = "#071321"
+            yellow = "#ffd21f"
+            # Sfondo
+            icon.put(bg, to=(0, 0, 31, 31))
+            # Fulmine stilizzato a pixel, scalato 2x
+            rows = [
+                "...........Y........",
+                "..........YYY.......",
+                ".........YYYY.......",
+                "........YYYYY.......",
+                ".......YYYYY........",
+                "......YYYYY.........",
+                ".....YYYYYYYYYYYY...",
+                "....YYYYYYYYYYYY....",
+                "........YYYY........",
+                ".......YYYY.........",
+                "......YYYY..........",
+                ".....YYYY...........",
+            ]
+            # Disegno ingrandito centrato
+            for y, row in enumerate(rows):
+                for x, ch in enumerate(row):
+                    if ch == "Y":
+                        xx = 5 + x
+                        yy = 3 + y * 2
+                        if 0 <= xx < 32 and 0 <= yy < 32:
+                            icon.put(yellow, to=(xx, yy, min(31, xx+1), min(31, yy+1)))
+            self._naplex_icon = icon
+            self.iconphoto(True, icon)
+        except Exception:
+            self._naplex_icon = None
+
+    def _build_brand_header(self):
+        """Header grafico in stile Naplex Prime."""
+        header = tk.Frame(self, bg="#071321", height=72, highlightthickness=1,
+                          highlightbackground="#193451")
+        header.pack(fill="x", side="top", padx=0, pady=0)
+        header.pack_propagate(False)
+
+        logo = tk.Frame(header, bg="#071321")
+        logo.pack(side="left", padx=(20, 10))
+        tk.Label(logo, text="⚡", font=("Segoe UI Symbol", 32, "bold"),
+                 fg="#ffd21f", bg="#071321").pack(side="left")
+        tk.Label(logo, text="NAPLEX", font=("Segoe UI", 20, "bold"),
+                 fg="#ffd21f", bg="#071321").pack(side="left", padx=(8, 0))
+        tk.Label(logo, text="PRIME", font=("Segoe UI", 20, "bold"),
+                 fg="#ffd21f", bg="#071321").pack(side="left", padx=(5, 0))
+
+        tk.Frame(header, bg="#ffd21f", width=1, height=34).pack(side="left", padx=18)
+        tk.Label(header, text="FFmpeg GUI Ultimate", font=("Segoe UI", 16, "bold"),
+                 fg="#ffd21f", bg="#071321").pack(side="left")
+        tk.Label(header, text="v1.2 AI", font=("Segoe UI", 15, "bold"),
+                 fg="#ffd21f", bg="#071321").pack(side="left", padx=(8, 0))
+        tk.Label(header, text="by naplex 19", font=("Segoe UI", 11),
+                 fg="#ffd21f", bg="#071321").pack(side="left", padx=(12, 0))
+        tk.Label(header, text=datetime.now().strftime("📅  oggi %d/%m/%Y"),
+                 font=("Segoe UI", 10), fg="#ffd21f", bg="#071321").pack(side="right", padx=20)
+
+    def build_ui(self):
+        self._create_naplex_icon()
+        self._build_brand_header()
+
+        # Notebook principale
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        # Dashboard Naplex Prime
+        self.tab_dashboard = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_dashboard, text="  🏠 Principale  ")
+
+        # Tab 2: Sorgente & Output
+        self.tab_src = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_src, text="  📁 File & Output  ")
+
+        # Tab 3: Video & Audio
+        self.tab_av = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_av, text="  🎬 Video & Audio  ")
+
+        # Tab 3: Avanzate
+        self.tab_adv = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_adv, text="  ✂️ Split  ")
+
+        # Tab 4: Preset & Utility
+        self.tab_util = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_util, text="  🛠 Utility  ")
+
+        self.tab_ai = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_ai, text="  🧠 AI Auto-Fix  ")
+
+        self.tab_queue = ScrollableFrame(self.notebook)
+        self.notebook.add(self.tab_queue, text="  📋 Coda e Log  ")
+
+        # Costruzione contenuto tab
+        self._build_tab_dashboard(self.tab_dashboard.inner)
+        self._build_stream_inventory(self.tab_dashboard.inner)
+        if TKDND_OK:
+            # Ultimo passaggio: registra anche la tabella stream appena creata.
+            self._register_dnd_tree(self.tab_dashboard.inner)
+        self._build_tab_source(self.tab_src.inner)
+        self._build_tab_av(self.tab_av.inner)
+        self._build_tab_advanced(self.tab_adv.inner)
+        self._build_tab_utility(self.tab_util.inner)
+        self._build_tab_ai(self.tab_ai.inner)
+        self._build_tab_queue(self.tab_queue.inner)
+
+        # ---------- Barra inferiore: progress + status ----------
+        bottom = ttk.Frame(self, padding=(8, 4))
+        bottom.pack(fill="x", side="bottom")
+
+        # Status bar
+        self.status = tk.StringVar(value=f"Pronto — Naplex Prime | FFmpeg GUI Ultimate v{SETTINGS_VERSION}")
+        ttk.Label(bottom, textvariable=self.status, relief="sunken",
+                  anchor="w").pack(fill="x", pady=(4, 0))
+
+        # Info runtime
+        info = ttk.Frame(bottom)
+        info.pack(fill="x", pady=(4, 0))
+        ttk.Label(info, text="File corrente:").pack(side="left")
+        ttk.Label(info, textvariable=self.current_file,
+                  foreground="#ffd21f").pack(side="left", padx=(4, 16))
+        ttk.Label(info, text="Speed:").pack(side="left")
+        ttk.Label(info, textvariable=self.current_speed,
+                  foreground="#ffd21f").pack(side="left", padx=(4, 16))
+        ttk.Label(info, text="ETA:").pack(side="left")
+        ttk.Label(info, textvariable=self.current_eta,
+                  foreground="#ffd21f").pack(side="left", padx=(4, 10))
+        ttk.Label(info, textvariable=self.cpu_usage_var,
+                  foreground=pal["fg"], font=("Segoe UI", 9, "bold")).pack(side="left", padx=(8, 10))
+        ttk.Label(info, textvariable=self.gpu_usage_var,
+                  foreground=pal["fg"], font=("Segoe UI", 9, "bold")).pack(side="left", padx=(8, 10))
+        ttk.Label(info, textvariable=self.ram_usage_var,
+                  foreground=pal["fg"], font=("Segoe UI", 9, "bold")).pack(side="left", padx=(8, 0))
+
+        # Barra progress
+        self.progress = ttk.Progressbar(
+            bottom, variable=self.current_progress,
+            maximum=100, mode="determinate"
+        )
+        self.progress.pack(fill="x", pady=(6, 6))
+
+        # Bottoni azione globali
+        actions = ttk.Frame(bottom)
+        actions.pack(fill="x")
+
+        ttk.Button(actions, text="🔍 Scansiona",
+                   command=self.scan).pack(side="left", padx=(0, 6))
+        self.start_btn = ttk.Button(actions, text="▶  Avvia encoding",
+                                    command=self.start, style="Naplex.Accent.TButton")
+        self.start_btn.pack(side="left", padx=(0, 6))
+        self.stop_btn = ttk.Button(actions, text="■  Annulla",
+                                   command=self.cancel_work, state="disabled")
+        self.stop_btn.pack(side="left", padx=(0, 6))
+        self.pause_btn = ttk.Button(actions, text="⏸  Pausa",
+                                    command=self.toggle_pause, state="disabled")
+        self.pause_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="📂 Apri output",
+                   command=self.open_output).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="🗑  Pulisci log",
+                   command=lambda: self.log.delete("1.0", "end")).pack(side="right")
+
+    # =================================================================
+    # ===== TAB 1: SORGENTE & OUTPUT ==================================
+    # =================================================================
+    def _build_tab_dashboard(self, parent):
+        """Dashboard principale in stile Naplex Prime, coerente con il mockup fornito."""
+        parent.configure(padding=6)
+        root = ttk.Frame(parent, style="Naplex.TFrame")
+        root.pack(fill="both", expand=True, padx=6, pady=6)
+        root.columnconfigure(0, weight=1, minsize=300)
+        root.columnconfigure(1, weight=2, minsize=500)
+        root.columnconfigure(2, weight=1, minsize=330)
+        root.rowconfigure(0, weight=1)
+
+        # ---------- COLONNA SINISTRA ----------
+        left = ttk.Frame(root, style="Naplex.TFrame")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.rowconfigure(0, weight=1)
+        left.rowconfigure(1, weight=0)
+
+        file_box = ttk.LabelFrame(left, text="  📁  File  ", style="Naplex.TLabelframe", padding=12)
+        file_box.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        file_box.columnconfigure(0, weight=1)
+
+        drop = tk.Frame(file_box, bg="#071321", highlightthickness=1,
+                        highlightbackground="#2b5f91", highlightcolor="#168cff")
+        drop.grid(row=0, column=0, sticky="ew", pady=(2, 10))
+        tk.Label(drop, text="☁", font=("Segoe UI Symbol", 32, "bold"),
+                 fg="#ffd21f", bg="#071321").pack(pady=(12, 2))
+        tk.Label(drop, text="Trascina qui il tuo video", font=("Segoe UI", 11, "bold"),
+                 fg="#ffd21f", bg="#071321").pack()
+        tk.Label(drop, text="oppure clicca per selezionare", font=("Segoe UI", 10),
+                 fg="#ffd21f", bg="#071321").pack(pady=(2, 12))
+        drop.bind("<Button-1>", lambda e: self.choose_folder())
+        for c in drop.winfo_children():
+            c.bind("<Button-1>", lambda e: self.choose_folder())
+        ttk.Label(file_box, text="Cartella sorgente", style="Naplex.Muted.TLabel").grid(
+            row=1, column=0, sticky="w")
+        ttk.Entry(file_box, textvariable=self.folder).grid(row=2, column=0, sticky="ew", pady=(4, 8))
+        ttk.Button(file_box, text="📂 Sfoglia cartella", command=self.choose_folder,
+                   style="Naplex.Ghost.TButton").grid(row=3, column=0, sticky="ew")
+        ttk.Label(file_box, textvariable=self.dnd_status_var,
+                  style="Naplex.Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(6, 0))
+
+        info = ttk.LabelFrame(file_box, text="  Informazioni  ", style="Naplex.Inner.TLabelframe", padding=8)
+        info.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        info.columnconfigure(1, weight=1)
+        info_rows = [
+            ("File selezionato", self.current_file),
+            ("Durata", self.current_eta),
+            ("Speed", self.current_speed),
+        ]
+        for r, (label, var) in enumerate(info_rows):
+            ttk.Label(info, text=f"{label}:", style="Naplex.Muted.TLabel").grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Label(info, textvariable=var, style="Naplex.Value.TLabel").grid(row=r, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Button(info, text="ⓘ  Info file selezionato",
+                   command=self.show_selected_media_info,
+                   style="Naplex.Ghost.TButton").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        out_box = ttk.LabelFrame(left, text="  📁  Output  ", style="Naplex.TLabelframe", padding=10)
+        out_box.grid(row=1, column=0, sticky="ew")
+        ttk.Label(out_box, text="Destinazioni configurate:", style="Naplex.Muted.TLabel").pack(anchor="w")
+        self.dashboard_output_count = tk.StringVar(value="0 cartelle")
+        ttk.Label(out_box, textvariable=self.dashboard_output_count,
+                  style="Naplex.Value.TLabel").pack(anchor="w", pady=(2, 7))
+        ttk.Button(out_box, text="📂 Gestisci cartelle output", command=self.add_output,
+                   style="Naplex.Ghost.TButton").pack(fill="x")
+
+        # ---------- COLONNA CENTRALE ----------
+        center = ttk.LabelFrame(root, text="  ✂  Modalità di split  ", style="Naplex.TLabelframe", padding=14)
+        center.grid(row=0, column=1, sticky="nsew", padx=6)
+        center.columnconfigure(0, weight=1)
+        center.columnconfigure(1, weight=1)
+
+        modes = [
+            ("Per dimensione", "Per dimensione (MB)"),
+            ("Per durata", "Durata fissa"),
+            ("N parti", "N parti"),
+            ("Per capitoli", "Per capitoli"),
+        ]
+        for c, (label, value) in enumerate(modes):
+            ttk.Radiobutton(center, text=label, value=value,
+                            variable=self.split_mode_var,
+                            command=self.on_split_mode_change,
+                            style="Naplex.TRadiobutton").grid(row=0, column=c % 2, sticky="w",
+                                                              padx=(4 if c % 2 == 0 else 24, 4), pady=5)
+
+        ttk.Separator(center).grid(row=1, column=0, columnspan=2, sticky="ew", pady=10)
+
+        ttk.Label(center, text="Dimensione massima per parte (MB)",
+                  style="Naplex.Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 5))
+        ttk.Label(center, text="Preset auto-target",
+                  style="Naplex.Muted.TLabel").grid(row=2, column=1, sticky="w", pady=(0, 5))
+
+        self.dashboard_target = ttk.Combobox(
+            center, textvariable=self.target_var,
+            values=list(TARGET_OPTIONS), state="readonly"
+        )
+        self.dashboard_target.grid(row=3, column=0, sticky="ew", padx=(0, 8))
+        self.dashboard_target.bind("<<ComboboxSelected>>", lambda e: self.on_split_mode_change())
+
+        self.dashboard_autotarget = ttk.Combobox(
+            center, textvariable=self.auto_target_var,
+            values=list(AUTO_TARGET_OPTIONS), state="readonly"
+        )
+        self.dashboard_autotarget.grid(row=3, column=1, sticky="ew", padx=(8, 0))
+        self.dashboard_autotarget.bind("<<ComboboxSelected>>", lambda e: self.on_auto_target_change())
+
+        ttk.Separator(center).grid(row=4, column=0, columnspan=2, sticky="ew", pady=14)
+
+        ttk.Label(center, text="Formato output", style="Naplex.Muted.TLabel").grid(row=5, column=0, sticky="w")
+        ttk.Label(center, text="Codec video", style="Naplex.Muted.TLabel").grid(row=5, column=1, sticky="w")
+        ttk.Combobox(center, textvariable=self.output_ext_var,
+                     values=list(OUTPUT_EXT_OPTIONS), state="readonly").grid(
+                         row=6, column=0, sticky="ew", padx=(0, 8), pady=(5, 12))
+        ttk.Combobox(center, textvariable=self.codec_var,
+                     values=list(CODEC_OPTIONS), state="readonly").grid(
+                         row=6, column=1, sticky="ew", padx=(8, 0), pady=(5, 12))
+
+        ttk.Label(center, text="Codec audio", style="Naplex.Muted.TLabel").grid(row=7, column=0, sticky="w")
+        ttk.Label(center, text="Qualità / Profilo", style="Naplex.Muted.TLabel").grid(row=7, column=1, sticky="w")
+        ttk.Combobox(center, textvariable=self.audio_var,
+                     values=list(AUDIO_OPTIONS), state="readonly").grid(
+                         row=8, column=0, sticky="ew", padx=(0, 8))
+        ttk.Combobox(center, textvariable=self.encoder_preset_var,
+                     values=["Auto", "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+                     state="readonly").grid(row=8, column=1, sticky="ew", padx=(8, 0))
+
+        advanced = ttk.Frame(center, style="Naplex.Inner.TFrame")
+        advanced.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(16, 12))
+        ttk.Label(advanced, text="⚙  Opzioni avanzate", style="Naplex.Value.TLabel").pack(side="left", padx=10, pady=10)
+
+        action = ttk.Frame(center, style="Naplex.TFrame")
+        action.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        action.columnconfigure(0, weight=1)
+        action.columnconfigure(1, weight=0)
+        action.columnconfigure(2, weight=0)
+        ttk.Button(action, text="▶  Avvia encoding", command=self.start,
+                   style="Naplex.Accent.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=8)
+        self.dashboard_pause_btn = ttk.Button(action, text="Ⅱ  Pausa",
+                                              command=self.toggle_pause,
+                                              style="Naplex.Ghost.TButton")
+        self.dashboard_pause_btn.grid(row=0, column=1, padx=4, ipadx=12, ipady=8)
+        ttk.Button(action, text="■  Stop", command=self.cancel_work,
+                   style="Naplex.Danger.TButton").grid(row=0, column=2, padx=(4, 0), ipadx=12, ipady=8)
+
+        # ---------- COLONNA DESTRA ----------
+        right = ttk.Frame(root, style="Naplex.TFrame")
+        right.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
+        right.rowconfigure(3, weight=0)
+        right.rowconfigure(4, weight=0)
+
+        fm = ttk.LabelFrame(right, text="  ⚙  FFmpeg Manager  ", style="Naplex.TLabelframe", padding=10)
+        fm.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        fm.columnconfigure(0, weight=1)
+        ttk.Label(fm, textvariable=self.ffmpeg_status_var, style="Naplex.Success.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(fm, text="FFmpeg:", style="Naplex.Muted.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Entry(fm, textvariable=self.ffmpeg_path_var).grid(row=2, column=0, sticky="ew", pady=(3, 7))
+        ttk.Button(fm, text="🌐  Scarica FFmpeg", command=lambda: webbrowser.open(FFMPEG_DOWNLOAD_URL),
+                   style="Naplex.Accent.TButton").grid(row=3, column=0, sticky="ew", pady=4)
+        ttk.Button(fm, text="✓  Test FFmpeg + ffprobe", command=self.test_ffmpeg_installation,
+                   style="Naplex.Ghost.TButton").grid(row=4, column=0, sticky="ew", pady=4)
+        ttk.Button(fm, text="📋  Copia diagnostica", command=self.copy_ffmpeg_diagnostics,
+                   style="Naplex.Ghost.TButton").grid(row=5, column=0, sticky="ew", pady=4)
+        ttk.Button(fm, text="📂  Apri cartella log/output", command=self.open_log_folder,
+                   style="Naplex.Ghost.TButton").grid(row=6, column=0, sticky="ew", pady=4)
+
+        # ---------- MAP Manager rapido ----------
+        map_dash = ttk.LabelFrame(right, text="  🗺  MAP / Stream Manager  ", style="Naplex.TLabelframe", padding=10)
+        map_dash.grid(row=1, column=0, sticky="nsew", pady=(6, 6))
+        ttk.Label(map_dash, text="Gestisci rapidamente gli stream del file selezionato.",
+                  style="Naplex.Muted.TLabel", wraplength=300).pack(anchor="w", pady=(0, 6))
+        ttk.Label(map_dash, textvariable=self.map_status_var if hasattr(self, "map_status_var") else tk.StringVar(value="Seleziona un file e carica gli stream"),
+                  style="Naplex.Value.TLabel", wraplength=300).pack(anchor="w", pady=(0, 6))
+        map_actions = ttk.Frame(map_dash, style="Naplex.Inner.TFrame")
+        map_actions.pack(fill="x")
+        ttk.Button(map_actions, text="🔎 Carica stream", command=self._dashboard_load_map).pack(side="left", padx=(0, 4), pady=4)
+        ttk.Button(map_actions, text="✓ Tutti", command=self.map_select_all).pack(side="left", padx=4, pady=4)
+        ttk.Button(map_actions, text="✕ Nessuno", command=self.map_clear).pack(side="left", padx=4, pady=4)
+        ttk.Button(map_actions, text="Apri manager", command=self._open_map_manager).pack(side="left", padx=4, pady=4)
+
+        util = ttk.LabelFrame(right, text="  🛠  Altre funzioni utili  ", style="Naplex.TLabelframe", padding=10)
+        util.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        ttk.Button(util, text="🗑  Pulisci file temporanei",
+                   command=self.cleanup_temp_files, style="Naplex.Ghost.TButton").pack(fill="x", pady=4)
+        ttk.Button(util, text="📄  Report JSON sessione",
+                   command=self.save_session_report, style="Naplex.Ghost.TButton").pack(fill="x", pady=4)
+        ttk.Button(util, text="⚙  Impostazioni / Utility",
+                   command=lambda: self.notebook.select(self.tab_util),
+                   style="Naplex.Ghost.TButton").pack(fill="x", pady=4)
+
+        status = ttk.Label(right, text="●  Pronto", style="Naplex.Success.TLabel")
+        status.grid(row=3, column=0, sticky="sw", pady=(8, 0))
+
+        resources = ttk.LabelFrame(right, text="  📊  Monitor sistema durante encoding  ",
+                                   style="Naplex.TLabelframe", padding=10)
+        resources.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        resources.columnconfigure(1, weight=1)
+        ttk.Label(resources, text="CPU", style="Naplex.Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(resources, textvariable=self.cpu_usage_var,
+                  style="Naplex.Success.TLabel").grid(row=0, column=1, sticky="e")
+        ttk.Label(resources, text="GPU", style="Naplex.Muted.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(resources, textvariable=self.gpu_usage_var,
+                  style="Naplex.Success.TLabel").grid(row=1, column=1, sticky="e")
+        ttk.Label(resources, text="RAM", style="Naplex.Muted.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(resources, textvariable=self.ram_usage_var,
+                  style="Naplex.Success.TLabel").grid(row=2, column=1, sticky="e")
+
+        # Mantiene aggiornato il contatore output senza alterare la logica esistente.
+        def refresh_dashboard_count():
+            try:
+                count = len(self.output_dirs)
+                self.dashboard_output_count.set(f"{count} cartell{'a' if count == 1 else 'e'}")
+            except Exception:
+                pass
+            self.after(1200, refresh_dashboard_count)
+        self.after(200, refresh_dashboard_count)
+
+    def _build_stream_inventory(self, parent):
+        box = ttk.LabelFrame(parent, text="  📡  Stream per file — vista gerarchica Master/Detail  ",
+                             style="Naplex.TLabelframe", padding=10)
+        box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        top = ttk.Frame(box, style="Naplex.Inner.TFrame")
+        top.pack(fill="x", pady=(0, 6))
+        self.stream_inventory_status = tk.StringVar(value="Pronto — Aggiorna per leggere file × file")
+        ttk.Label(top, textvariable=self.stream_inventory_status,
+                  style="Naplex.Muted.TLabel").pack(side="left", fill="x", expand=True)
+        ttk.Button(top, text="🔄 Aggiorna stream", command=self.refresh_stream_inventory).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="🗺 Apri MAP manager", command=self._open_map_manager).pack(side="right")
+
+        frame = ttk.Frame(box)
+        frame.pack(fill="both", expand=True)
+        cols = ("level", "index", "type", "codec", "lang", "title", "details", "forced")
+        self.stream_inventory_tree = ttk.Treeview(frame, columns=cols, show="tree headings", height=11)
+        heads = {"#0":"File / Stream", "level":"Livello", "index":"#", "type":"Tipo",
+                 "codec":"Codec", "lang":"Lingua", "title":"Titolo", "details":"Dettagli", "forced":"Forced"}
+        widths = {"#0":360, "level":70, "index":45, "type":85, "codec":105,
+                  "lang":75, "title":220, "details":310, "forced":65}
+        self.stream_inventory_tree.heading("#0", text=heads["#0"])
+        self.stream_inventory_tree.column("#0", width=widths["#0"], anchor="w")
+        for c in cols:
+            self.stream_inventory_tree.heading(c, text=heads[c])
+            self.stream_inventory_tree.column(c, width=widths[c], anchor="w")
+        self.stream_inventory_tree.column("index", anchor="center")
+        self.stream_inventory_tree.column("forced", anchor="center")
+        ysb = ttk.Scrollbar(frame, orient="vertical", command=self.stream_inventory_tree.yview)
+        xsb = ttk.Scrollbar(box, orient="horizontal", command=self.stream_inventory_tree.xview)
+        self.stream_inventory_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.stream_inventory_tree.pack(side="left", fill="both", expand=True)
+        ysb.pack(side="right", fill="y")
+        xsb.pack(fill="x", pady=(4, 0))
+        self.stream_inventory_tree.bind("<<TreeviewSelect>>", self._stream_inventory_select)
+
+    def _stream_inventory_sources(self):
+        paths, seen = [], set()
+        if hasattr(self, "tree"):
+            for iid in self.tree.get_children():
+                pth = Path(str(iid))
+                if pth.is_file() and pth.suffix.lower() in VIDEO_EXT:
+                    key = str(pth.resolve())
+                    if key not in seen:
+                        seen.add(key); paths.append(pth)
+        with self.queue_lock:
+            jobs = [self.queue_jobs[jid] for jid in self.queue_order if jid in self.queue_jobs]
+        for job in jobs:
+            pth = Path(job.get("source", ""))
+            if pth.is_file() and pth.suffix.lower() in VIDEO_EXT:
+                key = str(pth.resolve())
+                if key not in seen:
+                    seen.add(key); paths.append(pth)
+        return paths
+
+    def _stream_inventory_select(self, event=None):
+        if not hasattr(self, "stream_inventory_tree"):
+            return
+        item = self.stream_inventory_tree.focus()
+        if not item:
+            return
+        parent = self.stream_inventory_tree.parent(item)
+        src_iid = parent or item
+        path = self.stream_inventory_tree.item(src_iid, "text")
+        if path and Path(path).is_file():
+            self.map_source = str(Path(path).resolve())
+            self.map_status_var.set(f"File stream selezionato: {Path(path).name}")
+
+    def refresh_stream_inventory(self):
+        if not hasattr(self, "stream_inventory_tree"):
+            return
+        paths = self._stream_inventory_sources()
+        for iid in self.stream_inventory_tree.get_children():
+            self.stream_inventory_tree.delete(iid)
+        if not paths:
+            self.stream_inventory_status.set("Nessun file video da analizzare")
+            return
+        self.stream_inventory_status.set(f"Analisi stream in corso: {len(paths)} file…")
+
+        def worker(snapshot):
+            rows = []
+            for pth in snapshot:
+                try:
+                    info = ffprobe(pth)
+                    rows.append((pth, info.get("streams", []), None))
+                except Exception as exc:
+                    rows.append((pth, [], str(exc)))
+            self.after(0, lambda r=rows: self._populate_stream_inventory(r))
+
+        threading.Thread(target=worker, args=(paths,), daemon=True, name="StreamInventory").start()
+
+    def _populate_stream_inventory(self, rows):
+        if not hasattr(self, "stream_inventory_tree"):
+            return
+        for iid in self.stream_inventory_tree.get_children():
+            self.stream_inventory_tree.delete(iid)
+        total_streams = 0
+        for pth, streams, error in rows:
+            parent_iid = self.stream_inventory_tree.insert(
+                "", "end", text=str(pth),
+                values=("FILE", "", "", "", "", "",
+                        f"{len(streams)} stream" if not error else "ffprobe error", ""),
+                open=True
+            )
+            if error:
+                self.stream_inventory_tree.insert(
+                    parent_iid, "end", text="ffprobe",
+                    values=("STREAM", "", "ERROR", "", "", "", error, "")
+                )
+                continue
+            for stream in streams:
+                idx = stream.get("index", "?")
+                typ = stream.get("codec_type", "?")
+                codec = stream.get("codec_name", "?")
+                tags = stream.get("tags", {}) or {}
+                lang = tags.get("language", "—")
+                title = tags.get("title", "—") or "—"
+                disp = stream.get("disposition", {}) or {}
+                forced = "YES" if disp.get("forced", 0) == 1 else ""
+                if typ == "video":
+                    details = f"{stream.get('width','?')}x{stream.get('height','?')} | {stream.get('r_frame_rate','?')}"
+                elif typ == "audio":
+                    details = f"{stream.get('channels','?')}ch | {stream.get('sample_rate','?')} Hz | {stream.get('channel_layout','?')}"
+                elif typ == "subtitle":
+                    details = "forced subtitle" if forced else "subtitle"
+                else:
+                    details = ""
+                self.stream_inventory_tree.insert(
+                    parent_iid, "end", text=f"Stream {idx} — {typ}",
+                    values=("STREAM", idx, typ, codec, lang, title, details, forced)
+                )
+                total_streams += 1
+        self.stream_inventory_status.set(f"Completato: {len(rows)} file — {total_streams} stream totali")
+
+    def _build_tab_source(self, parent):
+        # ---------- Sorgente ----------
+        src_box = ttk.LabelFrame(parent, text="Sorgente", padding=10)
+        src_box.pack(fill="x", padx=10, pady=(10, 6))
+        src_box.columnconfigure(1, weight=1)
+
+        ttk.Label(src_box, text="Cartella sorgente:").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Entry(src_box, textvariable=self.folder).grid(
+            row=0, column=1, sticky="ew", padx=8
+        )
+        ttk.Button(src_box, text="Sfoglia…",
+                   command=self.choose_folder).grid(row=0, column=2)
+
+        ttk.Checkbutton(src_box, text="Scansione ricorsiva",
+                        variable=self.recursive).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        ttk.Checkbutton(src_box, text="Processa SOLO file > 4 GiB",
+                        variable=self.only_over_4gib).grid(
+            row=1, column=2, sticky="w", pady=(6, 0)
+        )
+
+        # ---------- Output multipli ----------
+        out_box = ttk.LabelFrame(parent, text="Destinazioni di output (multipli)",
+                                 padding=10)
+        out_box.pack(fill="x", padx=10, pady=(0, 6))
+        out_box.columnconfigure(0, weight=1)
+
+        self.output_listbox = tk.Listbox(out_box, height=4, selectmode="extended")
+        self.output_listbox.grid(row=0, column=0, sticky="ew")
+
+        out_btns = ttk.Frame(out_box)
+        out_btns.grid(row=0, column=1, sticky="n", padx=(6, 0))
+        ttk.Button(out_btns, text="Aggiungi…",
+                   command=self.add_output).pack(fill="x")
+        ttk.Button(out_btns, text="Rimuovi",
+                   command=self.remove_output).pack(fill="x", pady=(4, 0))
+        ttk.Button(out_btns, text="Svuota",
+                   command=self.clear_outputs).pack(fill="x", pady=(4, 0))
+
+        # ---------- Struttura cartelle ----------
+        struct_box = ttk.LabelFrame(parent, text="Struttura cartelle", padding=10)
+        struct_box.pack(fill="x", padx=10, pady=(0, 6))
+        struct_box.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            struct_box,
+            text="📺 Rileva serie TV dal nome file (SxxExx / 1x01 / ecc.)",
+            variable=self.smart_tv_paths,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Checkbutton(
+            struct_box,
+            text="🎬 Rileva film dal nome file (Nome (Anno))",
+            variable=self.detect_movies,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(struct_box, text="Layout:").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        struct_combo = ttk.Combobox(
+            struct_box, textvariable=self.folder_structure_var,
+            values=list(FOLDER_STRUCTURE_OPTIONS.keys()),
+            state="readonly", width=42,
+        )
+        struct_combo.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Label(
+            struct_box,
+            text="Esempi:  Mom (2013) - S01E01 - Titolo.mkv  →  Mom (2013)/Season 01/",
+            foreground=pal["fg"],
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # ---------- Lista file ----------
+        files_box = ttk.LabelFrame(parent, text="File trovati", padding=10)
+        files_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        tree_frame = ttk.Frame(files_box)
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("file", "dest", "size", "threshold", "parts", "state"),
+            show="headings", height=12,
+        )
+        for col, title, width in [
+            ("file",      "File",        300),
+            ("dest",      "Destinazione", 300),
+            ("size",      "Dimensione",   110),
+            ("threshold", "Soglia",        80),
+            ("parts",     "Parti",         60),
+            ("state",     "Stato",        360),
+        ]:
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, anchor="w")
+        self.tree.column("size", anchor="e")
+        self.tree.column("parts", anchor="center")
+        self.tree.column("threshold", anchor="center")
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        sb.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=sb.set)
+
+        # ---------- Log ----------
+        log_box = ttk.LabelFrame(parent, text="Log FFmpeg", padding=10)
+        log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self.log = tk.Text(log_box, height=12, wrap="word")
+        self.log.pack(fill="both", expand=True)
+
+    # =================================================================
+    # ===== TAB 2: VIDEO & AUDIO ======================================
+    # =================================================================
+    def _build_tab_av(self, parent):
+        # ---------- Modalità split ----------
+        split_box = ttk.LabelFrame(parent, text="Modalità di split", padding=10)
+        split_box.pack(fill="x", padx=10, pady=(10, 6))
+        split_box.columnconfigure(1, weight=1)
+        split_box.columnconfigure(3, weight=1)
+
+        ttk.Label(split_box, text="Modalità:").grid(row=0, column=0, sticky="w")
+        self.split_mode_combo = ttk.Combobox(
+            split_box, textvariable=self.split_mode_var,
+            values=list(SPLIT_MODE_OPTIONS.keys()),
+            state="readonly", width=26,
+        )
+        self.split_mode_combo.grid(row=0, column=1, sticky="w", padx=8)
+        self.split_mode_combo.bind("<<ComboboxSelected>>",
+                                   lambda e: self.on_split_mode_change())
+
+        # --- Riga: target size ---
+        self.lbl_target = ttk.Label(split_box, text="Dimensione target:")
+        self.lbl_target.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.target_combo = ttk.Combobox(
+            split_box, textvariable=self.target_var,
+            values=list(TARGET_OPTIONS), state="readonly", width=12,
+        )
+        self.target_combo.grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        self.lbl_auto_target = ttk.Label(split_box, text="Auto-target (upload):")
+        self.lbl_auto_target.grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(8, 0))
+        self.auto_target_combo = ttk.Combobox(
+            split_box, textvariable=self.auto_target_var,
+            values=list(AUTO_TARGET_OPTIONS.keys()),
+            state="readonly", width=30,
+        )
+        self.auto_target_combo.grid(row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+        self.auto_target_combo.bind("<<ComboboxSelected>>",
+                                    lambda e: self.on_auto_target_change())
+
+        # --- Riga: durata fissa ---
+        self.lbl_duration = ttk.Label(split_box, text="Durata per parte:")
+        self.lbl_duration.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.duration_combo = ttk.Combobox(
+            split_box, textvariable=self.duration_var,
+            values=list(DURATION_OPTIONS.keys()),
+            state="readonly", width=20,
+        )
+        self.duration_combo.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+        self.duration_combo.bind("<<ComboboxSelected>>",
+                                 lambda e: self.on_duration_change())
+
+        self.lbl_custom_duration = ttk.Label(split_box, text="Custom (secondi):")
+        self.lbl_custom_duration.grid(row=2, column=2, sticky="w",
+                                      padx=(16, 0), pady=(8, 0))
+        self.custom_duration_spin = ttk.Spinbox(
+            split_box, from_=10, to=36000, increment=30,
+            textvariable=self.custom_duration_sec_var, width=10,
+        )
+        self.custom_duration_spin.grid(row=2, column=3, sticky="w",
+                                       padx=8, pady=(8, 0))
+
+        # --- Riga: N parti ---
+        self.lbl_parts = ttk.Label(split_box, text="Numero di parti:")
+        self.lbl_parts.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.parts_combo = ttk.Combobox(
+            split_box, textvariable=self.parts_n_var,
+            values=PARTS_OPTIONS, state="readonly", width=8,
+        )
+        self.parts_combo.grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        # --- Riga: capitoli (info) ---
+        self.lbl_chapters = ttk.Label(
+            split_box,
+            text="Split per capitoli: usa i capitoli del file (ffprobe).",
+            foreground=pal["fg"],
+        )
+        self.lbl_chapters.grid(row=3, column=2, columnspan=2, sticky="w",
+                               padx=(16, 0), pady=(8, 0))
+
+        # --- Rinomina parti ---
+        ttk.Label(split_box, text="Rinomina parti:").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        self.rename_combo = ttk.Combobox(
+            split_box, textvariable=self.rename_part_var,
+            values=list(RENAME_PART_OPTIONS.keys()),
+            state="readonly", width=26,
+        )
+        self.rename_combo.grid(row=4, column=1, sticky="w", padx=8, pady=(8, 0))
+        self.rename_combo.bind("<<ComboboxSelected>>",
+                               lambda e: self.on_rename_change())
+
+        ttk.Label(split_box, text="Template custom:").grid(
+            row=4, column=2, sticky="w", padx=(16, 0), pady=(8, 0)
+        )
+        self.rename_custom_entry = ttk.Entry(
+            split_box, textvariable=self.rename_custom_template, width=30,
+        )
+        self.rename_custom_entry.grid(row=4, column=3, sticky="ew",
+                                      padx=8, pady=(8, 0))
+
+        ttk.Label(
+            split_box,
+            text="Placeholder: {stem} {part} {total} {show} {season} {episode} {title} {ext}",
+            foreground=pal["fg"],
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # ---------- Video ----------
+        v_box = ttk.LabelFrame(parent, text="Video", padding=10)
+        v_box.pack(fill="x", padx=10, pady=(0, 6))
+        v_box.columnconfigure(1, weight=1)
+        v_box.columnconfigure(3, weight=1)
+
+        ttk.Label(v_box, text="Codec video:").grid(row=0, column=0, sticky="w")
+        self.codec_combo = ttk.Combobox(
+            v_box, textvariable=self.codec_var,
+            values=list(CODEC_OPTIONS.keys()), state="readonly", width=32,
+        )
+        self.codec_combo.grid(row=0, column=1, sticky="w", padx=8)
+        self.codec_combo.bind("<<ComboboxSelected>>",
+                              lambda e: self.on_codec_change())
+
+        ttk.Label(v_box, text="Preset encoder:").grid(
+            row=0, column=2, sticky="w", padx=(16, 0)
+        )
+        self.encoder_preset_combo = ttk.Combobox(
+            v_box, textvariable=self.encoder_preset_var,
+            values=PRESET_ENCODER_OPTIONS, state="readonly", width=14,
+        )
+        self.encoder_preset_combo.grid(row=0, column=3, sticky="w", padx=8)
+
+        ttk.Label(v_box, text="Preset NVENC:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.nvenc_preset_combo = ttk.Combobox(
+            v_box, textvariable=self.nvenc_preset_var,
+            values=NVENC_PRESET_OPTIONS, state="readonly", width=8,
+        )
+        self.nvenc_preset_combo.grid(row=1, column=1, sticky="w",
+                                     padx=8, pady=(8, 0))
+
+        ttk.Label(v_box, text="Tune:").grid(
+            row=1, column=2, sticky="w", padx=(16, 0), pady=(8, 0)
+        )
+        ttk.Combobox(
+            v_box, textvariable=self.tune_var,
+            values=TUNE_OPTIONS, state="readonly", width=14,
+        ).grid(row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Label(v_box, text="Risoluzione:").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            v_box, textvariable=self.resolution_var,
+            values=list(RESOLUTION_OPTIONS.keys()),
+            state="readonly", width=14,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Label(v_box, text="FPS:").grid(
+            row=2, column=2, sticky="w", padx=(16, 0), pady=(8, 0)
+        )
+        ttk.Combobox(
+            v_box, textvariable=self.fps_var,
+            values=list(FPS_OPTIONS.keys()), state="readonly", width=10,
+        ).grid(row=2, column=3, sticky="w", padx=8, pady=(8, 0))
+
+        # Bitrate video: textbox libera (kbps, oppure Mbps)
+        ttk.Label(v_box, text="Bitrate video:").grid(
+            row=3, column=0, sticky="w", pady=(10, 0)
+        )
+        self.video_br_scale = ttk.Entry(
+            v_box, textvariable=self.video_br_var, width=16
+        )
+        self.video_br_scale.grid(row=3, column=1, sticky="w",
+                                 padx=8, pady=(10, 0))
+        ttk.Label(v_box, text="kbps (0 = Auto)").grid(
+            row=3, column=2, sticky="w", padx=(4, 0), pady=(10, 0)
+        )
+        ttk.Label(v_box, textvariable=self.video_br_label,
+                  width=22, anchor="w").grid(
+            row=3, column=3, sticky="w", padx=8, pady=(10, 0)
+        )
+
+        # CRF
+        ttk.Label(v_box, text="CRF (qualità, 0=auto bitrate):").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Spinbox(v_box, from_=0, to=51, textvariable=self.crf_var,
+                    width=6).grid(row=4, column=1, sticky="w",
+                                  padx=8, pady=(8, 0))
+
+        # Checkbox video extra
+        cbv = ttk.Frame(v_box)
+        cbv.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(cbv, text="Denoise (hqdn3d)",
+                        variable=self.denoise).pack(side="left")
+        ttk.Checkbutton(cbv, text="Deinterlace (yadif)",
+                        variable=self.deinterlace).pack(side="left", padx=12)
+        ttk.Checkbutton(cbv, text="HDR → SDR tonemap",
+                        variable=self.hdr_tonemap).pack(side="left")
+
+        # ---------- Audio ----------
+        a_box = ttk.LabelFrame(parent, text="Audio", padding=10)
+        a_box.pack(fill="x", padx=10, pady=(0, 6))
+        a_box.columnconfigure(1, weight=1)
+
+        ttk.Label(a_box, text="Codec audio:").grid(row=0, column=0, sticky="w")
+        self.audio_combo = ttk.Combobox(
+            a_box, textvariable=self.audio_var,
+            values=list(AUDIO_OPTIONS.keys()), state="readonly", width=22,
+        )
+        self.audio_combo.grid(row=0, column=1, sticky="w", padx=8)
+        self.audio_combo.bind("<<ComboboxSelected>>",
+                              lambda e: self.on_audio_change())
+
+        ttk.Label(a_box, text="Bitrate audio:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.audio_br_scale = ttk.Entry(
+            a_box, textvariable=self.audio_br_var, width=16
+        )
+        self.audio_br_scale.grid(row=1, column=1, sticky="w",
+                                 padx=8, pady=(8, 0))
+        ttk.Label(a_box, text="kbps (0 = Auto)").grid(
+            row=1, column=2, sticky="w", padx=(4, 0), pady=(8, 0)
+        )
+        ttk.Label(a_box, textvariable=self.audio_br_label,
+                  width=22, anchor="w").grid(
+            row=1, column=3, sticky="w", padx=8, pady=(8, 0)
+        )
+
+        ttk.Checkbutton(a_box, text="Normalizza loudness (loudnorm EBU R128)",
+                        variable=self.loudnorm).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+
+        # ---------- Gestione MAP / Stream ----------
+        map_box = ttk.LabelFrame(parent, text="Gestione MAP / Stream", padding=10)
+        map_box.pack(fill="both", expand=False, padx=10, pady=(0, 6))
+        ttk.Label(
+            map_box,
+            text="Seleziona gli stream da includere nell'output. Doppio clic su una riga = attiva/disattiva MAP.",
+        ).pack(anchor="w", pady=(0, 6))
+        map_top = ttk.Frame(map_box)
+        map_top.pack(fill="x", pady=(0, 6))
+        ttk.Button(map_top, text="🔎 Carica stream", command=self.load_map_streams).pack(side="left", padx=(0, 5))
+        ttk.Button(map_top, text="✓ Tutti", command=self.map_select_all).pack(side="left", padx=5)
+        ttk.Button(map_top, text="🎬 Solo video", command=lambda: self.map_select_type("video")).pack(side="left", padx=5)
+        ttk.Button(map_top, text="🔊 Solo audio", command=lambda: self.map_select_type("audio")).pack(side="left", padx=5)
+        ttk.Button(map_top, text="💬 Solo sottotitoli", command=lambda: self.map_select_type("subtitle")).pack(side="left", padx=5)
+        ttk.Button(map_top, text="✕ Nessuno", command=self.map_clear).pack(side="left", padx=5)
+        self.map_status_var.set("MAP automatico: seleziona un file e premi Carica stream")
+        ttk.Label(map_top, textvariable=self.map_status_var, style="Naplex.Value.TLabel").pack(side="right", padx=6)
+
+        map_frame = ttk.Frame(map_box)
+        map_frame.pack(fill="x")
+        cols = ("use", "index", "type", "codec", "lang", "title", "details")
+        self.map_tree = ttk.Treeview(map_frame, columns=cols, show="headings", height=7)
+        heads = {"use":"MAP", "index":"#", "type":"Tipo", "codec":"Codec", "lang":"Lingua", "title":"Titolo", "details":"Dettagli"}
+        widths = {"use":55, "index":45, "type":85, "codec":110, "lang":80, "title":220, "details":300}
+        for c in cols:
+            self.map_tree.heading(c, text=heads[c])
+            self.map_tree.column(c, width=widths[c], anchor="w")
+        map_scroll = ttk.Scrollbar(map_frame, orient="vertical", command=self.map_tree.yview)
+        self.map_tree.configure(yscrollcommand=map_scroll.set)
+        self.map_tree.pack(side="left", fill="x", expand=True)
+        map_scroll.pack(side="right", fill="y")
+        self.map_tree.bind("<Double-1>", self.toggle_map_stream)
+        ttk.Label(
+            map_box,
+            text="Quando hai selezionato almeno uno stream, FFmpeg userà -map espliciti. Senza selezione viene usato il mapping automatico.",
+            style="Naplex.Muted.TLabel",
+        ).pack(anchor="w", pady=(5, 0))
+
+        # ---------- Sottotitoli & Container ----------
+        s_box = ttk.LabelFrame(parent, text="Sottotitoli & Container", padding=10)
+        s_box.pack(fill="x", padx=10, pady=(0, 10))
+        s_box.columnconfigure(1, weight=1)
+
+        ttk.Label(s_box, text="Sottotitoli:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            s_box, textvariable=self.subtitle_var,
+            values=list(SUBTITLE_OPTIONS.keys()),
+            state="readonly", width=32,
+        ).grid(row=0, column=1, sticky="w", padx=8)
+
+        ttk.Checkbutton(
+            s_box,
+            text="-default_mode infer_no_sub (evita autoload sub)",
+            variable=self.infer_no_sub,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(s_box, text="Estensione output:").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        self.output_ext_combo = ttk.Combobox(
+            s_box, textvariable=self.output_ext_var,
+            values=OUTPUT_EXT_OPTIONS, state="readonly", width=20,
+        )
+        self.output_ext_combo.grid(row=2, column=1, sticky="w",
+                                   padx=8, pady=(8, 0))
+        self.output_ext_combo.bind("<<ComboboxSelected>>",
+                                   lambda e: self.on_output_ext_change())
+
+        # Checkbox FFmpeg
+        cb = ttk.Frame(s_box)
+        cb.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(cb, text="-pix_fmt yuv420p",
+                        variable=self.opt_pix_fmt_yuv420p).pack(side="left")
+        ttk.Checkbutton(cb, text="-movflags +faststart",
+                        variable=self.opt_movflags_faststart).pack(side="left",
+                                                                   padx=16)
+
+    # =================================================================
+    # ===== MAP / STREAM MANAGER =======================================
+    # =================================================================
+    def _map_selected_items(self):
+        return [idx for idx, enabled in self.map_streams.items() if enabled]
+
+    def load_map_streams(self):
+        src = None
+        if getattr(self, "map_source", None):
+            candidate = Path(self.map_source)
+            if candidate.is_file():
+                src = candidate
+        if src is None and hasattr(self, "tree"):
+            items = list(self.tree.selection()) or list(self.tree.get_children())[:1]
+            if items:
+                candidate = Path(items[0])
+                if candidate.is_file():
+                    src = candidate
+        if src is None:
+            messagebox.showinfo("MAP / Stream", "Seleziona o analizza prima un file video.")
+            return
+        try:
+            info = ffprobe(src)
+        except Exception as e:
+            messagebox.showerror("MAP / Stream", f"Impossibile leggere gli stream:\n{e}")
+            return
+        self.map_source = str(src.resolve())
+        self.map_streams = {}
+        if self.map_tree:
+            for iid in self.map_tree.get_children():
+                self.map_tree.delete(iid)
+            for s in info.get("streams", []):
+                idx = s.get("index")
+                if idx is None:
+                    continue
+                typ = s.get("codec_type", "?")
+                codec = s.get("codec_name", "?")
+                lang = (s.get("tags", {}) or {}).get("language", "—")
+                title = (s.get("tags", {}) or {}).get("title", "") or "—"
+                if typ == "video":
+                    details = f"{s.get('width','?')}x{s.get('height','?')} | {s.get('r_frame_rate','?')}"
+                elif typ == "audio":
+                    details = f"{s.get('channels','?')}ch | {s.get('sample_rate','?')} Hz"
+                elif typ == "subtitle":
+                    details = "forced" if is_forced(s) else ""
+                else:
+                    details = ""
+                self.map_streams[int(idx)] = False
+                self.map_tree.insert("", "end", iid=str(idx), values=("☐", idx, typ, codec, lang, title, details))
+        self.map_status_var.set(f"{src.name} — {len(info.get('streams', []))} stream trovati | MAP automatico")
+
+    def toggle_map_stream(self, event=None):
+        if not self.map_tree:
+            return
+        item = self.map_tree.identify_row(event.y) if event else self.map_tree.focus()
+        if not item:
+            return
+        try:
+            idx = int(item)
+        except ValueError:
+            return
+        self.map_streams[idx] = not self.map_streams.get(idx, False)
+        vals = list(self.map_tree.item(item, "values"))
+        vals[0] = "☑" if self.map_streams[idx] else "☐"
+        self.map_tree.item(item, values=vals)
+        selected = self._map_selected_items()
+        self.map_status_var.set(f"MAP manuale: {len(selected)} stream selezionati" if selected else "MAP automatico")
+
+    def _set_map_filter(self, predicate):
+        if not self.map_streams:
+            self.load_map_streams()
+        if not self.map_tree:
+            return
+        for iid in self.map_tree.get_children():
+            vals = self.map_tree.item(iid, "values")
+            try:
+                idx = int(iid)
+            except ValueError:
+                continue
+            enabled = predicate(str(vals[2]).lower())
+            self.map_streams[idx] = enabled
+            vals = list(vals)
+            vals[0] = "☑" if enabled else "☐"
+            self.map_tree.item(iid, values=vals)
+        selected = self._map_selected_items()
+        self.map_status_var.set(f"MAP manuale: {len(selected)} stream selezionati" if selected else "MAP automatico")
+
+    def map_select_all(self):
+        self._set_map_filter(lambda typ: True)
+
+    def map_select_type(self, stream_type):
+        self._set_map_filter(lambda typ: typ == stream_type)
+
+    def map_clear(self):
+        for idx in list(self.map_streams):
+            self.map_streams[idx] = False
+        if self.map_tree:
+            for iid in self.map_tree.get_children():
+                vals = list(self.map_tree.item(iid, "values"))
+                vals[0] = "☐"
+                self.map_tree.item(iid, values=vals)
+        self.map_status_var.set("MAP automatico")
+
+    # =================================================================
+    # ===== TAB 3: AVANZATE ===========================================
+    # =================================================================
+    def _build_tab_advanced(self, parent):
+        # ---------- Argomenti extra FFmpeg ----------
+        extra_box = ttk.LabelFrame(parent, text="Argomenti FFmpeg extra",
+                                   padding=10)
+        extra_box.pack(fill="x", padx=10, pady=(10, 6))
+        extra_box.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            extra_box,
+            text="Argomenti aggiunti PRIMA del file di output. "
+                 "Supporta quoting con apici.",
+            foreground=pal["fg"],
+        ).grid(row=0, column=0, sticky="w")
+
+        self.extra_args_text = tk.Text(
+            extra_box, height=3, wrap="word", font=("TkFixedFont", 9),
+        )
+        self.extra_args_text.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+        ttk.Label(
+            extra_box,
+            text="Esempio:  -profile:v high -level 4.1 -x264-params ref=4",
+            foreground=pal["fg"],
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        # ---------- Performance ----------
+        perf_box = ttk.LabelFrame(parent, text="Performance", padding=10)
+        perf_box.pack(fill="x", padx=10, pady=(0, 6))
+        perf_box.columnconfigure(1, weight=1)
+        perf_box.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(perf_box, text="Auto-workers (core CPU - 1)",
+                        variable=self.auto_workers,
+                        command=self.on_auto_workers_change).grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(perf_box, text="Workers paralleli:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.workers_spin = ttk.Spinbox(
+            perf_box, from_=1, to=16, textvariable=self.parallel_workers, width=4,
+        )
+        self.workers_spin.grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Label(perf_box, text="Threads FFmpeg (-threads):").grid(
+            row=1, column=2, sticky="w", padx=(16, 0), pady=(8, 0)
+        )
+        ttk.Combobox(
+            perf_box, textvariable=self.threads_var,
+            values=THREADS_OPTIONS, state="readonly", width=8,
+        ).grid(row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Label(perf_box, text="Priorità processo:").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            perf_box, textvariable=self.priority_var,
+            values=PRIORITY_OPTIONS, state="readonly", width=16,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Checkbutton(
+            perf_box, text="Fallback NVENC/QSV/AMF → CPU in caso di errore",
+            variable=self.fallback_nvenc,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Checkbutton(
+            perf_box, text="Verifica spazio disco prima dell'avvio",
+            variable=self.check_disk_space,
+        ).grid(row=3, column=2, columnspan=2, sticky="w",
+               pady=(8, 0), padx=(16, 0))
+
+        # ---------- Gestione file di input ----------
+        del_box = ttk.LabelFrame(parent, text="Gestione file di input",
+                                 padding=10)
+        del_box.pack(fill="x", padx=10, pady=(0, 6))
+        del_box.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            del_box,
+            text="🗑  Elimina/sposta il file di INPUT dopo encoding riuscito  "
+                 "(⚠ IRREVERSIBILE!)",
+            variable=self.delete_input_after,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(del_box, text="Modalità:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.delete_mode_combo = ttk.Combobox(
+            del_box, textvariable=self.delete_mode_var,
+            values=[
+                "Sposta in _TRASH (recuperabile)",
+                "Cestino di sistema (send2trash)",
+                "Elimina definitivamente",
+                "Sposta in cartella custom",
+            ],
+            state="readonly", width=32,
+        )
+        self.delete_mode_combo.grid(row=1, column=1, sticky="w",
+                                    padx=8, pady=(8, 0))
+        self.delete_mode_combo.bind("<<ComboboxSelected>>",
+                                    lambda e: self.on_delete_mode_change())
+
+        ttk.Label(del_box, text="Cartella custom:").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        self.custom_trash_entry = ttk.Entry(
+            del_box, textvariable=self.custom_trash_dir, width=42,
+        )
+        self.custom_trash_entry.grid(row=2, column=1, sticky="ew",
+                                     padx=8, pady=(8, 0))
+        ttk.Button(del_box, text="Sfoglia…",
+                   command=self.choose_custom_trash_dir).grid(
+            row=2, column=2, padx=4, pady=(8, 0)
+        )
+
+        # ---------- Opzioni file/metadati ----------
+        file_box = ttk.LabelFrame(parent, text="File & Metadati", padding=10)
+        file_box.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Checkbutton(file_box, text="Sovrascrivi output esistente",
+                        variable=self.overwrite).pack(anchor="w")
+        ttk.Checkbutton(file_box, text="Salta parti già esistenti",
+                        variable=self.skip_existing).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(file_box, text="Copia metadati originali",
+                        variable=self.copy_metadata).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(file_box,
+                        text="Usa nome file come titolo (se manca metadata)",
+                        variable=self.use_filename_as_title).pack(anchor="w",
+                                                                  pady=(4, 0))
+
+        # ---------- Metadata statici / Logo ----------
+        media_box = ttk.LabelFrame(parent, text="Metadata statici e logo", padding=10)
+        media_box.pack(fill="x", padx=10, pady=(0, 6))
+        media_box.columnconfigure(1, weight=1)
+
+        fields = [
+            ("Titolo:", self.static_title_var),
+            ("Artista:", self.static_artist_var),
+            ("Album:", self.static_album_var),
+            ("Genere:", self.static_genre_var),
+            ("Commento:", self.static_comment_var),
+            ("Anno:", self.static_year_var),
+        ]
+        for r, (label, var) in enumerate(fields):
+            ttk.Label(media_box, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(media_box, textvariable=var).grid(row=r, column=1, sticky="ew", padx=8, pady=2)
+
+        ttk.Checkbutton(media_box, text="Aggiungi logo sovrapposto al video",
+                        variable=self.static_logo_enabled).grid(row=0, column=2, sticky="w", padx=(12, 4))
+        ttk.Label(media_box, text="File logo:").grid(row=1, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(media_box, textvariable=self.static_logo_path, width=34).grid(row=2, column=2, sticky="ew", padx=(12, 4))
+        ttk.Button(media_box, text="Scegli logo…", command=self.choose_logo_file).grid(row=3, column=2, sticky="w", padx=(12, 4), pady=3)
+        ttk.Label(media_box, text="Posizione:").grid(row=4, column=2, sticky="w", padx=(12, 4), pady=(8, 0))
+        ttk.Combobox(media_box, textvariable=self.static_logo_position, state="readonly", width=22,
+                     values=["In alto a sinistra", "In alto a destra", "In basso a sinistra", "In basso a destra", "Centro"]).grid(row=5, column=2, sticky="w", padx=(12, 4), pady=2)
+        ttk.Label(media_box, text="Dimensione (% larghezza video):").grid(row=6, column=2, sticky="w", padx=(12, 4), pady=(6, 0))
+        ttk.Spinbox(media_box, from_=3, to=40, textvariable=self.static_logo_size, width=8).grid(row=7, column=2, sticky="w", padx=(12, 4))
+        ttk.Label(media_box, text="Opacità (%):").grid(row=8, column=2, sticky="w", padx=(12, 4), pady=(6, 0))
+        ttk.Spinbox(media_box, from_=10, to=100, textvariable=self.static_logo_opacity, width=8).grid(row=9, column=2, sticky="w", padx=(12, 4))
+        ttk.Label(media_box, text="Il logo richiede una ricodifica video.", foreground="#ffd21f").grid(row=10, column=2, sticky="w", padx=(12, 4), pady=(5, 0))
+
+        # ---------- Log & Notifiche ----------
+        log_box = ttk.LabelFrame(parent, text="Log & Notifiche", padding=10)
+        log_box.pack(fill="x", padx=10, pady=(0, 10))
+
+        ttk.Checkbutton(log_box, text="Salva log CSV (split_log.csv)",
+                        variable=self.save_log_csv).pack(anchor="w")
+        ttk.Checkbutton(log_box, text="Salva log JSON (split_log.json)",
+                        variable=self.save_log_json).pack(anchor="w", pady=(4, 0))
+        if PLYER_OK:
+            ttk.Checkbutton(
+                log_box, text="Notifiche desktop a fine encoding",
+                variable=self.notify_desktop,
+            ).pack(anchor="w", pady=(4, 0))
+        else:
+            ttk.Label(log_box,
+                      text="(Notifiche desktop non disponibili: pip install plyer)",
+                      foreground="#ffd21f").pack(anchor="w", pady=(4, 0))
+
+    def choose_logo_file(self):
+        path = filedialog.askopenfilename(
+            title="Scegli il logo",
+            filetypes=[("Immagini", "*.png *.jpg *.jpeg *.webp"), ("Tutti i file", "*.*")],
+        )
+        if path:
+            self.static_logo_path.set(path)
+            self.static_logo_enabled.set(True)
+
+    def _logo_overlay_filter(self):
+        """Restituisce il filter_complex per il logo oppure None."""
+        if not self.static_logo_enabled.get() or not self.static_logo_path.get():
+            return None
+        try:
+            pct = max(3, min(40, int(self.static_logo_size.get())))
+            opacity = max(10, min(100, int(self.static_logo_opacity.get()))) / 100.0
+        except Exception:
+            pct, opacity = 12, 1.0
+        pos = self.static_logo_position.get()
+        if pos == "In alto a sinistra":
+            xy = "20:20"
+        elif pos == "In alto a destra":
+            xy = "W-w-20:20"
+        elif pos == "In basso a sinistra":
+            xy = "20:H-h-20"
+        elif pos == "Centro":
+            xy = "(W-w)/2:(H-h)/2"
+        else:
+            xy = "W-w-20:H-h-20"
+        # scala il logo alla percentuale della larghezza video; format=rgba consente l'alpha
+        return f"[1:v]scale=iw*{pct}/100:-1,format=rgba,colorchannelmixer=aa={opacity}[logo];[0:v][logo]overlay={xy}:format=auto[vout]"
+
+    def apply_theme(self):
+        """Tema Naplex Prime: sfondo blu e tutte le scritte dell’interfaccia in giallo ad alto contrasto."""
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        theme = self.theme_var.get() or "Bianco"
+        palettes = {
+            "Naplex Prime": {
+                # Tema legacy mantenuto per compatibilita.
+                "bg": "#061426", "panel": "#08213a", "panel2": "#0b2b4a",
+                "field": "#061a30", "fg": "#eaf4ff", "muted": "#9db9d5",
+                "border": "#234c73", "accent": "#087df5", "accent2": "#168cff",
+                "yellow": "#ffd21f", "green": "#2ee57b", "danger": "#ef5350",
+                "select": "#164f84"
+            },
+            "Sistema": {"bg": self.cget("bg"), "panel": self.cget("bg"), "panel2": self.cget("bg"),
+                        "field": "#ffffff", "fg": "#202020", "muted": "#666666",
+                        "border": "#cccccc", "accent": "#087df5", "accent2": "#1291ff",
+                        "yellow": "#ffd21f", "green": "#1e9e57", "danger": "#c62828", "select": "#cfe3ff"},
+            "Chiaro": {"bg": "#f2f2f2", "panel": "#ffffff", "panel2": "#f7f7f7",
+                       "field": "#ffffff", "fg": "#202020", "muted": "#666666",
+                       "border": "#cccccc", "accent": "#087df5", "accent2": "#1291ff",
+                       "yellow": "#b58b00", "green": "#18864b", "danger": "#c62828", "select": "#cfe3ff"},
+            "Scuro": {"bg": "#202020", "panel": "#292929", "panel2": "#333333",
+                      "field": "#242424", "fg": "#f2f2f2", "muted": "#bdbdbd",
+                      "border": "#555555", "accent": "#4a4a4a", "accent2": "#606060",
+                      "yellow": "#ffd21f", "green": "#39ff88", "danger": "#ff5a5a", "select": "#505050"},
+            "Bianco": {"bg": "#ffffff", "panel": "#ffffff", "panel2": "#f4f4f4",
+                       "field": "#ffffff", "fg": "#111111", "muted": "#333333",
+                       "border": "#c8c8c8", "accent": "#e8e8e8", "accent2": "#d8d8d8",
+                       "yellow": "#111111", "green": "#111111", "danger": "#b00020", "select": "#dcdcdc"},
+            "Blu": {"bg": "#071a2d", "panel": "#0d2944", "panel2": "#123858", "field": "#071a2d", "fg": "#eaf4ff", "muted": "#9db9d5", "border": "#2a6597", "accent": "#087df5", "accent2": "#168cff", "yellow": "#ffd21f", "green": "#2ee57b", "danger": "#ef5350", "select": "#164f84"},
+            "Verde": {"bg": "#102219", "panel": "#153022", "panel2": "#1b3b2a",
+                      "field": "#102219", "fg": "#e9fff0", "muted": "#9bc5a8",
+                      "border": "#3a7350", "accent": "#2e9e68", "accent2": "#41bd7d",
+                      "yellow": "#ffd21f", "green": "#2ee57b", "danger": "#ef5350", "select": "#285d40"},
+            "Contrasto": {"bg": "#000000", "panel": "#050505", "panel2": "#111111",
+                          "field": "#000000", "fg": "#ffffff", "muted": "#dddddd",
+                          "border": "#ffffff", "accent": "#0066ff", "accent2": "#3388ff",
+                          "yellow": "#ffff00", "green": "#00ff66", "danger": "#ff3333", "select": "#3333aa"},
+        }
+        pal = palettes.get(theme, palettes["Bianco"])
+
+        self.configure(bg=pal["bg"])
+
+        # Base
+        style.configure("TFrame", background=pal["bg"])
+        style.configure("Naplex.TFrame", background=pal["bg"])
+        style.configure("Naplex.Inner.TFrame", background=pal["panel2"])
+        style.configure("TLabel", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"))
+        style.configure("Naplex.Muted.TLabel", background=pal["bg"], foreground=pal["muted"],
+                        font=("Segoe UI", 9, "bold"))
+        style.configure("Naplex.Value.TLabel", background=pal["bg"], foreground=pal["fg"],
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("Naplex.Success.TLabel", background=pal["bg"], foreground=pal["fg"],
+                        font=("Segoe UI", 10, "bold"))
+
+        # Card / LabelFrame
+        style.configure("TLabelframe", background=pal["panel"], foreground=pal["fg"],
+                        bordercolor=pal["border"], relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=pal["panel"], foreground=pal["fg"],
+                        font=("Segoe UI", 11, "bold"))
+        style.configure("Naplex.TLabelframe", background=pal["panel"], foreground=pal["fg"],
+                        bordercolor=pal["border"], relief="solid", borderwidth=1)
+        style.configure("Naplex.TLabelframe.Label", background=pal["panel"], foreground=pal["fg"],
+                        font=("Segoe UI", 11, "bold"))
+        style.configure("Naplex.Inner.TLabelframe", background=pal["panel2"], foreground=pal["fg"],
+                        bordercolor=pal["border"], relief="solid", borderwidth=1)
+        style.configure("Naplex.Inner.TLabelframe.Label", background=pal["panel2"], foreground=pal["fg"],
+                        font=("Segoe UI", 10, "bold"))
+
+        # Controls — Naplex Prime: NESSUN PULSANTE GRIGIO.
+        # Tutti i pulsanti sono blu con testo giallo ad alto contrasto.
+        button_blue = pal.get("accent", "#e8e8e8")
+        button_blue_hover = pal.get("accent2", "#d8d8d8")
+        button_blue_pressed = "#c8c8c8"
+        button_blue_disabled = "#eeeeee"
+        button_yellow = pal.get("yellow", "#111111")
+
+        style.configure("TButton", background=button_blue, foreground=button_yellow,
+                        bordercolor=button_blue_hover, lightcolor=button_blue_hover,
+                        darkcolor=button_blue_pressed, relief="solid", borderwidth=1,
+                        padding=(12, 8), font=("Segoe UI", 10, "bold"))
+        style.map("TButton",
+                  background=[("disabled", button_blue_disabled),
+                              ("pressed", button_blue_pressed),
+                              ("active", button_blue_hover)],
+                  foreground=[("disabled", button_yellow),
+                              ("pressed", button_yellow),
+                              ("active", button_yellow)])
+
+        style.configure("Naplex.Ghost.TButton", background=button_blue, foreground=button_yellow,
+                        bordercolor=button_blue_hover, lightcolor=button_blue_hover,
+                        darkcolor=button_blue_pressed, relief="solid", borderwidth=1,
+                        padding=(11, 8), font=("Segoe UI", 10, "bold"))
+        style.map("Naplex.Ghost.TButton",
+                  background=[("disabled", button_blue_disabled), ("active", button_blue_hover),
+                              ("pressed", button_blue_pressed)],
+                  foreground=[("disabled", button_yellow), ("active", button_yellow),
+                              ("pressed", button_yellow)])
+
+        style.configure("Naplex.Accent.TButton", background=button_blue, foreground=button_yellow,
+                        bordercolor="#39a0ff", lightcolor="#39a0ff", darkcolor=button_blue_pressed,
+                        relief="solid", borderwidth=1, padding=(14, 10),
+                        font=("Segoe UI", 11, "bold"))
+        style.map("Naplex.Accent.TButton",
+                  background=[("disabled", button_blue_disabled), ("active", button_blue_hover),
+                              ("pressed", button_blue_pressed)],
+                  foreground=[("disabled", button_yellow), ("active", button_yellow),
+                              ("pressed", button_yellow)])
+
+        style.configure("Naplex.Danger.TButton", background=button_blue, foreground=button_yellow,
+                        bordercolor=button_blue_hover, lightcolor=button_blue_hover,
+                        darkcolor=button_blue_pressed, relief="solid", borderwidth=1,
+                        padding=(11, 8), font=("Segoe UI", 10, "bold"))
+        style.map("Naplex.Danger.TButton",
+                  background=[("disabled", button_blue_disabled), ("active", button_blue_hover),
+                              ("pressed", pal.get("danger", "#ef5350"))],
+                  foreground=[("disabled", button_yellow), ("active", button_yellow),
+                              ("pressed", button_yellow)])
+
+        style.configure("TCheckbutton", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"))
+        style.configure("TRadiobutton", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", 10))
+        style.configure("Naplex.TRadiobutton", background=pal["panel"], foreground=pal["fg"],
+                        font=("Segoe UI", 10, "bold"))
+        style.map("TRadiobutton", background=[("active", pal["panel"])],
+                  foreground=[("disabled", "#d6ad00")])
+
+        # Notebook
+        style.configure("TNotebook", background=pal["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background=pal["panel"], foreground=pal["fg"],
+                        bordercolor=pal["border"], padding=(22, 11),
+                        font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab",
+                  background=[("selected", pal["accent"]), ("active", pal["panel2"])],
+                  foreground=[("selected", pal["yellow"]), ("active", pal["yellow"])])
+
+        # Input controls
+        style.configure("TEntry", fieldbackground=pal["field"], foreground=pal["fg"],
+                        insertcolor=pal["fg"], bordercolor=pal["border"],
+                        lightcolor=pal["border"], darkcolor=pal["border"], padding=7)
+        style.configure("TCombobox", fieldbackground=pal["field"], foreground=pal["fg"],
+                        arrowcolor=pal["fg"], bordercolor=pal["border"],
+                        lightcolor=pal["border"], darkcolor=pal["border"], padding=6)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", pal["field"])],
+                  foreground=[("readonly", pal["fg"])],
+                  selectbackground=[("readonly", pal["select"])],
+                  selectforeground=[("readonly", pal["yellow"])])
+
+        # Tree / progress / separators
+        style.configure("Treeview", background=pal["field"], fieldbackground=pal["field"],
+                        foreground=pal["fg"], rowheight=28, bordercolor=pal["border"],
+                        font=("Segoe UI", 9))
+        style.map("Treeview", background=[("selected", pal["accent"])],
+                  foreground=[("selected", "#ffd21f")])
+        style.configure("Treeview.Heading", background=pal["panel2"], foreground=pal["fg"],
+                        bordercolor=pal["border"], font=("Segoe UI", 9, "bold"))
+        style.configure("TProgressbar", troughcolor=pal["panel2"], background=pal["accent"],
+                        bordercolor=pal["border"], lightcolor=pal["accent"], darkcolor=pal["accent"])
+        style.configure("Horizontal.TSeparator", background=pal["border"])
+        style.configure("Vertical.TScrollbar", background=pal["panel2"],
+                        troughcolor=pal["bg"], bordercolor=pal["border"],
+                        arrowcolor=pal["fg"])
+
+        for widget in self.winfo_children():
+            self._theme_widget(widget, pal)
+
+        self.update_idletasks()
+
+    def _theme_widget(self, widget, pal):
+        try:
+            if isinstance(widget, tk.Text):
+                widget.configure(bg=pal["field"], fg=pal["fg"], insertbackground=pal["fg"],
+                                 selectbackground=pal["select"], selectforeground=pal["yellow"],
+                                 relief="flat", highlightthickness=1,
+                                 highlightbackground=pal["border"], highlightcolor=pal["accent"])
+            elif isinstance(widget, tk.Canvas):
+                widget.configure(bg=pal["bg"])
+            elif isinstance(widget, tk.Entry):
+                widget.configure(bg=pal["field"], fg=pal["fg"], insertbackground=pal["fg"],
+                                 selectbackground=pal["select"], selectforeground=pal["yellow"],
+                                 relief="flat", highlightthickness=1,
+                                 highlightbackground=pal["border"], highlightcolor=pal["accent"])
+            elif isinstance(widget, tk.Listbox):
+                widget.configure(bg=pal["field"], fg=pal["fg"],
+                                 selectbackground=pal["accent"], selectforeground=pal["yellow"],
+                                 relief="flat", highlightthickness=1,
+                                 highlightbackground=pal["border"])
+            elif isinstance(widget, tk.Spinbox):
+                widget.configure(bg=pal["field"], fg=pal["fg"], insertbackground=pal["fg"],
+                                 buttonbackground=pal["panel2"],
+                                 selectbackground=pal["select"], selectforeground=pal["yellow"],
+                                 relief="flat", highlightthickness=1,
+                                 highlightbackground=pal["border"], highlightcolor=pal["accent"])
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            self._theme_widget(child, pal)
+
+    # =================================================================
+    # ===== TAB 4: PRESET & UTILITY ===================================
+    # =================================================================
+    def _initialize_ffmpeg_manager(self):
+        """Inizializza il resolver senza obbligare FFmpeg a essere nel PATH."""
+        configured = str(self.ffmpeg_path_var.get() or "").strip()
+        global FFMPEG_CONFIGURED_PATH
+        FFMPEG_CONFIGURED_PATH = configured
+        self.detect_ffmpeg(silent=True)
+
+    def choose_ffmpeg_path(self):
+        p = filedialog.askopenfilename(
+            title="Seleziona ffmpeg.exe",
+            filetypes=[("FFmpeg executable", "ffmpeg.exe"), ("Eseguibili", "*.exe"), ("Tutti i file", "*.*")]
+        )
+        if not p:
+            return
+        self.ffmpeg_path_var.set(p)
+        global FFMPEG_CONFIGURED_PATH
+        FFMPEG_CONFIGURED_PATH = p
+        self.detect_ffmpeg(silent=True)
+
+    def detect_ffmpeg(self, silent=False):
+        global FFMPEG_CONFIGURED_PATH
+        configured = str(self.ffmpeg_path_var.get() or "").strip()
+        if configured:
+            FFMPEG_CONFIGURED_PATH = configured
+        elif not self.ffmpeg_autodetect.get():
+            FFMPEG_CONFIGURED_PATH = ""
+
+        ff = resolve_ffmpeg_tool("ffmpeg")
+        fp = resolve_ffmpeg_tool("ffprobe")
+        if ff and fp:
+            self.ffmpeg_status_var.set(f"✓ FFmpeg pronto — {ff}  |  ffprobe OK")
+            # Mantieni vuoto il campo quando la scoperta è automatica: così
+            # l'utente può disattivare il fallback senza trasformare il path
+            # rilevato in una configurazione permanente.
+            if not configured and self.ffmpeg_autodetect.get():
+                self.ffmpeg_path_var.set("")
+            self.status.set("FFmpeg rilevato correttamente.")
+            if not silent:
+                self.logmsg(f"✓ FFmpeg rilevato: {ff}", "ok")
+                self.logmsg(f"✓ ffprobe rilevato: {fp}", "ok")
+            return True
+        if ff:
+            self.ffmpeg_status_var.set(f"⚠ FFmpeg OK, ffprobe non trovato — {ff}")
+        else:
+            self.ffmpeg_status_var.set("✗ FFmpeg non trovato. Usa Sfoglia oppure Scarica FFmpeg.")
+        if not silent:
+            self.logmsg("✗ FFmpeg/ffprobe non completamente disponibili.", "err")
+        return False
+
+    def open_ffmpeg_folder(self):
+        ff = resolve_ffmpeg_tool("ffmpeg")
+        if not ff:
+            messagebox.showwarning("FFmpeg", "FFmpeg non è stato trovato.")
+            return
+        folder = Path(ff).parent
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)], **_subprocess_hidden_kwargs())
+            else:
+                subprocess.Popen(["xdg-open", str(folder)], **_subprocess_hidden_kwargs())
+        except Exception as e:
+            messagebox.showerror("FFmpeg", str(e))
+
+    def test_ffmpeg_installation(self):
+        def worker():
+            ff = resolve_ffmpeg_tool("ffmpeg")
+            fp = resolve_ffmpeg_tool("ffprobe")
+            if not ff or not fp:
+                self.after(0, lambda: messagebox.showerror(
+                    "Test FFmpeg", "FFmpeg e/o ffprobe non sono disponibili."
+                ))
+                return
+            rc1, out1, err1 = run([ff, "-hide_banner", "-version"])
+            rc2, out2, err2 = run([fp, "-hide_banner", "-version"])
+            ok = rc1 == 0 and rc2 == 0
+            detail = (out1.splitlines()[0] if out1 else err1.strip()) + "\n" + \
+                     (out2.splitlines()[0] if out2 else err2.strip())
+            self.after(0, lambda: messagebox.showinfo(
+                "Test FFmpeg", ("✓ Installazione valida.\n\n" if ok else "✗ Test fallito.\n\n") + detail
+            ))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def copy_ffmpeg_diagnostics(self):
+        ff = resolve_ffmpeg_tool("ffmpeg") or "(non trovato)"
+        fp = resolve_ffmpeg_tool("ffprobe") or "(non trovato)"
+        data = (
+            "FFmpeg Split GUI — diagnostica FFmpeg\n"
+            f"OS: {os.name} / {sys.platform}\n"
+            f"Configurato: {self.ffmpeg_path_var.get() or '(automatico)'}\n"
+            f"ffmpeg: {ff}\n"
+            f"ffprobe: {fp}\n"
+            f"PATH ffmpeg: {shutil.which('ffmpeg') or '(non trovato)'}\n"
+            f"PATH ffprobe: {shutil.which('ffprobe') or '(non trovato)'}\n"
+        )
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(data)
+            self.logmsg("✓ Diagnostica FFmpeg copiata negli appunti.", "ok")
+        except Exception as e:
+            messagebox.showerror("Diagnostica", str(e))
+
+    def open_output_folder(self):
+        """Apre la cartella di output configurata, se esiste."""
+        try:
+            path = self.output_var.get().strip() if hasattr(self, "output_var") else ""
+            if not path:
+                messagebox.showinfo("Output", "Seleziona prima una cartella di output.")
+                return
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path) if os.name == "nt" else subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            messagebox.showerror("Output", f"Impossibile aprire la cartella:\n{e}")
+
+    def copy_current_ffmpeg_command(self):
+        """Copia l'ultimo comando FFmpeg generato nell'area appunti."""
+        try:
+            cmd = getattr(self, "last_ffmpeg_command", None)
+            if not cmd:
+                messagebox.showinfo("Comando FFmpeg", "Genera prima un comando con una scansione o un dry-run.")
+                return
+            text = subprocess.list2cmdline([str(x) for x in cmd])
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            messagebox.showinfo("Comando FFmpeg", "Ultimo comando copiato negli appunti.")
+        except Exception as e:
+            messagebox.showerror("Comando FFmpeg", f"Impossibile copiare il comando:\n{e}")
+
+    def show_selected_media_info(self):
+        items = list(self.tree.selection())
+        if not items:
+            items = list(self.tree.get_children())[:1]
+        if not items:
+            messagebox.showinfo("Info file", "Seleziona un file nella lista.")
+            return
+        src = Path(items[0])
+        try:
+            info = ffprobe(src)
+            streams = info.get("streams", [])
+            fmt = info.get("format", {})
+            lines = [
+                f"File: {src.name}",
+                f"Dimensione: {size_text(src.stat().st_size)}",
+                f"Durata: {fmt.get('duration', '—')} s",
+                f"Bitrate: {fmt.get('bit_rate', '—')}",
+                f"Video: {sum(1 for s in streams if s.get('codec_type') == 'video')}",
+                f"Audio: {sum(1 for s in streams if s.get('codec_type') == 'audio')}",
+                f"Sottotitoli: {sum(1 for s in streams if s.get('codec_type') == 'subtitle')}",
+            ]
+            for s in streams:
+                if s.get("codec_type") == "video":
+                    lines.append(
+                        f"Video codec: {s.get('codec_name','—')} "
+                        f"{s.get('width','?')}x{s.get('height','?')} "
+                        f"{s.get('r_frame_rate','?')}"
+                    )
+                    break
+            messagebox.showinfo("Info file", "\n".join(lines))
+        except Exception as e:
+            messagebox.showerror("Info file", f"Impossibile leggere il file:\n{e}")
+
+    def cleanup_temp_files(self):
+        roots = set()
+        for d in self.output_dirs:
+            roots.add(Path(d))
+        if self.folder.get():
+            roots.add(Path(self.folder.get()))
+        removed = 0
+        for root in roots:
+            if not root.exists():
+                continue
+            try:
+                for p in root.rglob(".naplex19_tmp_*"):
+                    if p.is_file():
+                        try:
+                            p.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+        self.logmsg(f"🧹 Pulizia temporanei completata: {removed} file rimossi.", "ok")
+
+    def open_log_folder(self):
+        folder = None
+        if self.output_dirs:
+            folder = Path(self.output_dirs[0])
+        elif self.folder.get():
+            folder = Path(self.folder.get())
+        if not folder:
+            messagebox.showinfo("Log", "Nessuna cartella di output disponibile.")
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)], **_subprocess_hidden_kwargs())
+            else:
+                subprocess.Popen(["xdg-open", str(folder)], **_subprocess_hidden_kwargs())
+        except Exception as e:
+            messagebox.showerror("Log", str(e))
+
+    def save_session_report(self):
+        if not self.log_rows:
+            messagebox.showinfo("Report", "Non ci sono ancora dati di sessione.")
+            return
+        p = filedialog.asksaveasfilename(
+            title="Salva report sessione",
+            defaultextension=".json",
+            initialfile=f"ffmpeg_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            filetypes=[("JSON", "*.json"), ("Tutti i file", "*.*")]
+        )
+        if not p:
+            return
+        report = {
+            "app": "FFmpeg Split GUI — naplex19",
+            "version": SETTINGS_VERSION,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "ffmpeg": resolve_ffmpeg_tool("ffmpeg"),
+            "ffprobe": resolve_ffmpeg_tool("ffprobe"),
+            "rows": self.log_rows,
+            "ai": {"fix_count": self.ai_fix_count, "history": self.ai_history,
+                   "last_error": self.ai_last_error},
+        }
+        try:
+            Path(p).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.logmsg(f"📄 Report sessione salvato: {p}", "ok")
+        except Exception as e:
+            messagebox.showerror("Report", str(e))
+
+    # =================================================================
+    # ===== AI AUTO-FIX / SELF-HEALING ================================
+    # =================================================================
+    def _build_tab_ai(self, parent):
+        box = ttk.LabelFrame(parent, text="🧠 AI Auto-Fix — Self-Healing Engine", padding=12)
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Label(box, text=(
+            "Motore locale di diagnosi e autoriparazione. Analizza errori Python/FFmpeg, "
+            "sceglie fallback sicuri e può riprovare automaticamente senza modificare "
+            "il sorgente in modo incontrollato."
+        ), wraplength=1050).pack(anchor="w", pady=(0, 10))
+
+        opts = ttk.Frame(box)
+        opts.pack(fill="x", pady=(0, 8))
+        ttk.Checkbutton(opts, text="AI attiva", variable=self.ai_enabled).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(opts, text="Retry automatico", variable=self.ai_auto_retry).pack(side="left", padx=12)
+        ttk.Checkbutton(opts, text="Autoriparazione configurazione", variable=self.ai_auto_config).pack(side="left", padx=12)
+        ttk.Checkbutton(opts, text="Modalità sicura (backup prima di modifiche)", variable=self.ai_safe_mode).pack(side="left", padx=12)
+
+        btns = ttk.Frame(box)
+        btns.pack(fill="x", pady=(0, 10))
+        ttk.Button(btns, text="🔎 Analizza ultimo errore", command=self.ai_analyze_last_error).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="🛠 Applica Auto-Fix", command=self.ai_apply_last_fix).pack(side="left", padx=6)
+        ttk.Button(btns, text="🧪 Test FFmpeg / encoder", command=self.ai_test_environment).pack(side="left", padx=6)
+        ttk.Button(btns, text="🧹 Pulisci AI log", command=self.ai_clear_history).pack(side="left", padx=6)
+
+        self.ai_status_var = tk.StringVar(value="AI pronta — nessun errore analizzato")
+        ttk.Label(box, textvariable=self.ai_status_var).pack(anchor="w", pady=(0, 6))
+
+        self.ai_report = tk.Text(box, height=26, wrap="word", relief="sunken")
+        self.ai_report.pack(fill="both", expand=True)
+        self.ai_report.insert("1.0", "AI Auto-Fix pronta.\n\nQuando FFmpeg fallisce, il motore salva automaticamente errore, comando e diagnosi.\n")
+        self.ai_report.configure(state="disabled")
+
+    def _ai_write(self, text, clear=False):
+        def ui():
+            try:
+                self.ai_report.configure(state="normal")
+                if clear:
+                    self.ai_report.delete("1.0", "end")
+                self.ai_report.insert("end", text + "\n")
+                self.ai_report.see("end")
+                self.ai_report.configure(state="disabled")
+            except Exception:
+                pass
+        self.after(0, ui)
+
+    def _ai_classify_error(self, stderr):
+        text = (stderr or "").lower()
+        rules = [
+            ("nvenc", ["nvenc", "nvcuda.dll", "nvencodeapi", "no nvenc capable", "cannot load nvcuda"],
+             "Encoder NVIDIA non utilizzabile", ["libx264", "libx265"]),
+            ("qsv", ["qsv", "libmfx", "onevpl", "vaapi", "no device available"],
+             "Accelerazione Intel/QSV non disponibile", ["libx264", "libx265"]),
+            ("amf", ["amf", "amfrt64", "amd media framework"],
+             "Accelerazione AMD/AMF non disponibile", ["libx264", "libx265"]),
+            ("encoder", ["unknown encoder", "encoder not found", "error initializing output stream", "incorrect codec parameters"],
+             "Encoder o parametri video incompatibili", ["libx264", "libx265"]),
+            ("audio", ["audio codec", "could not find tag", "codec not currently supported in container", "dts", "pcm_s16le"],
+             "Audio non compatibile con il container", ["aac"]),
+            ("mapping", ["stream map", "matches no streams", "invalid argument", "cannot find a matching stream"],
+             "Mapping/stream non valido", ["automatic mapping"]),
+            ("subtitle", ["subtitle", "subtitles", "ass", "ssa", "webvtt"],
+             "Sottotitoli incompatibili con il filtro/container", ["disabilita sottotitoli"]),
+            ("disk", ["no space left", "disk full", "not enough space", "could not write"],
+             "Spazio disco o scrittura output insufficiente", ["controllo spazio/percorso"]),
+            ("permission", ["permission denied", "access is denied", "operation not permitted"],
+             "Permessi insufficienti", ["scegli una cartella scrivibile"]),
+            ("input", ["no such file", "invalid data found", "moov atom not found", "end of file"],
+             "File sorgente mancante o danneggiato", ["ffprobe e verifica sorgente"]),
+        ]
+        for category, needles, explanation, actions in rules:
+            if any(n in text for n in needles):
+                return {"category": category, "explanation": explanation, "actions": actions}
+        return {"category": "unknown", "explanation": "Errore FFmpeg non riconosciuto", "actions": ["prova CPU + AAC", "controlla log completo"]}
+
+    def _ai_plan_fix(self, stderr, codec=None, audio_codec=None, sub_mode=None):
+        d = self._ai_classify_error(stderr)
+        plan = {"diagnosis": d, "codecs": [], "audio": audio_codec, "subtitle": sub_mode, "maps": "auto"}
+        c = codec or self.codec_var.get()
+        if d["category"] in ("nvenc", "qsv", "amf", "encoder", "unknown"):
+            plan["codecs"] = ["libx264", "libx265"]
+        elif c and c != "Copy (no re-encode)":
+            plan["codecs"] = [c, "libx264", "libx265"]
+        else:
+            plan["codecs"] = ["copy", "libx264"]
+        if d["category"] == "audio":
+            plan["audio"] = "aac"
+        if d["category"] == "subtitle":
+            plan["subtitle"] = "Copia (default - infer_no_sub)"
+            plan["disable_subtitles"] = True
+        if d["category"] == "mapping":
+            plan["maps"] = "auto"
+        return plan
+
+    def _ai_record(self, action, result="ok", details=""):
+        row = {"time": datetime.now().isoformat(timespec="seconds"), "action": action,
+               "result": result, "details": details}
+        self.ai_history.append(row)
+        self.ai_fix_count += 1 if result == "ok" else 0
+        self.logmsg(f"🧠 AI: {action} — {result} {details}".strip(), "ok" if result == "ok" else "warn")
+
+    def ai_capture_error(self, src=None, part=None, cmd=None, rc=None, stderr=""):
+        self.ai_last_error = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "source": str(src) if src else "",
+            "part": part,
+            "cmd": [str(x) for x in (cmd or [])],
+            "rc": rc,
+            "stderr": stderr or "",
+        }
+        plan = self._ai_plan_fix(stderr, self.codec_var.get(), self.audio_var.get(), self.subtitle_var.get())
+        self.ai_last_error["plan"] = plan
+        self.ai_status_var.set(f"AI: {plan['diagnosis']['explanation']}")
+        self._ai_write("\n══ AI DIAGNOSI ══")
+        self._ai_write(f"Categoria: {plan['diagnosis']['category']}")
+        self._ai_write(f"Problema: {plan['diagnosis']['explanation']}")
+        self._ai_write("Azioni: " + ", ".join(plan["diagnosis"]["actions"]))
+        self._ai_write("Fallback video: " + ", ".join(plan["codecs"]))
+        if plan.get("audio"):
+            self._ai_write("Audio consigliato: " + str(plan["audio"]))
+        if self.ai_enabled.get() and self.ai_auto_retry.get():
+            self._ai_record("diagnosi automatica", "ok", plan["diagnosis"]["category"])
+
+    def ai_analyze_last_error(self):
+        err = self.ai_last_error.get("stderr", "")
+        if not err:
+            messagebox.showinfo("AI Auto-Fix", "Non c'è ancora un errore FFmpeg disponibile.")
+            return
+        self.ai_capture_error(self.ai_last_error.get("source"), self.ai_last_error.get("part"),
+                              self.ai_last_error.get("cmd"), self.ai_last_error.get("rc"), err)
+        messagebox.showinfo("AI Auto-Fix", self.ai_last_error["plan"]["diagnosis"]["explanation"])
+
+    def ai_apply_last_fix(self):
+        if not self.ai_last_error:
+            messagebox.showinfo("AI Auto-Fix", "Nessun errore da correggere.")
+            return
+        plan = self.ai_last_error.get("plan") or self._ai_plan_fix(self.ai_last_error.get("stderr", ""))
+        changed = []
+        if self.ai_auto_config.get():
+            try:
+                if plan.get("audio") == "aac":
+                    self.audio_var.set("AAC")
+                    changed.append("audio → AAC")
+                if plan["diagnosis"]["category"] in ("nvenc", "qsv", "amf", "encoder"):
+                    self.codec_var.set("H.264 (libx264)")
+                    changed.append("video → H.264 CPU")
+                if plan.get("disable_subtitles"):
+                    self.infer_no_sub.set(True)
+                    changed.append("sottotitoli → gestione sicura")
+                self.on_codec_change()
+                self.on_audio_change()
+            except Exception as e:
+                self._ai_record("applicazione configurazione", "error", str(e))
+        if changed:
+            self._ai_record("autoriparazione configurazione", "ok", "; ".join(changed))
+            self.ai_status_var.set("AI: correzione applicata — riprova l'encoding")
+            self._ai_write("✓ Correzione applicata: " + "; ".join(changed))
+            messagebox.showinfo("AI Auto-Fix", "Correzione applicata:\n\n" + "\n".join("• " + x for x in changed))
+        else:
+            self._ai_record("autoriparazione configurazione", "info", "nessuna modifica necessaria")
+            messagebox.showinfo("AI Auto-Fix", "La diagnosi non richiede modifiche automatiche.")
+
+    def ai_test_environment(self):
+        def worker():
+            ff = resolve_ffmpeg_tool("ffmpeg")
+            if not ff:
+                self._ai_write("✗ FFmpeg non trovato")
+                self.ai_status_var.set("AI: FFmpeg non trovato")
+                return
+            rc, out, err = run([ff, "-hide_banner", "-encoders"])
+            text = out + "\n" + err
+            names = ["h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf", "libx264", "libx265", "aac"]
+            available = [n for n in names if re.search(r"\b" + re.escape(n) + r"\b", text)]
+            self._ai_write("\n══ TEST AMBIENTE ══")
+            self._ai_write("FFmpeg: " + str(ff))
+            self._ai_write("Encoder rilevati: " + (", ".join(available) if available else "nessuno dei principali"))
+            self._ai_record("test ambiente", "ok" if rc == 0 else "error", ", ".join(available))
+            self.ai_status_var.set("AI: test ambiente completato")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def ai_clear_history(self):
+        self.ai_history.clear()
+        self.ai_last_error.clear()
+        self.ai_fix_count = 0
+        self.ai_status_var.set("AI pronta — storico pulito")
+        self._ai_write("Storico AI pulito.", clear=True)
+
+    def ai_safe_source_backup(self):
+        """Crea un backup del file sorgente prima di eventuali patch future."""
+        if not self.ai_safe_mode.get():
+            return None
+        try:
+            source = Path(__file__).resolve()
+            backup_dir = source.parent / "AI_BACKUPS"
+            backup_dir.mkdir(exist_ok=True)
+            target = backup_dir / f"{source.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py.bak"
+            shutil.copy2(source, target)
+            self.ai_source_backup = str(target)
+            return target
+        except Exception as e:
+            self._ai_record("backup sorgente", "error", str(e))
+            return None
+
+    def _build_tab_utility(self, parent):
+        # ---------- FFmpeg Manager ----------
+        fm_box = ttk.LabelFrame(parent, text="🛠 FFmpeg Manager", padding=10)
+        fm_box.pack(fill="x", padx=10, pady=(10, 6))
+        fm_box.columnconfigure(1, weight=1)
+
+        ttk.Label(fm_box, text="Percorso FFmpeg:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(fm_box, textvariable=self.ffmpeg_path_var).grid(
+            row=0, column=1, sticky="ew", padx=8
+        )
+        ttk.Button(fm_box, text="Sfoglia…", command=self.choose_ffmpeg_path).grid(
+            row=0, column=2, padx=(0, 4)
+        )
+        ttk.Button(fm_box, text="🔎 Rileva", command=self.detect_ffmpeg).grid(
+            row=0, column=3, padx=(0, 4)
+        )
+
+        ttk.Label(
+            fm_box, textvariable=self.ffmpeg_status_var, foreground=pal["fg"]
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(7, 0))
+
+        fm_btns = ttk.Frame(fm_box)
+        fm_btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Button(
+            fm_btns, text="🌐 Scarica FFmpeg",
+            command=lambda: webbrowser.open(FFMPEG_DOWNLOAD_URL)
+        ).pack(side="left")
+        ttk.Button(
+            fm_btns, text="📁 Apri cartella",
+            command=self.open_ffmpeg_folder
+        ).pack(side="left", padx=6)
+        ttk.Button(
+            fm_btns, text="🧪 Test FFmpeg + ffprobe",
+            command=self.test_ffmpeg_installation
+        ).pack(side="left", padx=6)
+        ttk.Button(
+            fm_btns, text="📋 Copia diagnostica",
+            command=self.copy_ffmpeg_diagnostics
+        ).pack(side="left", padx=6)
+
+        ttk.Checkbutton(
+            fm_box,
+            text="Preferisci automaticamente PATH e percorsi statici se il campo è vuoto",
+            variable=self.ffmpeg_autodetect
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(7, 0))
+
+        ttk.Label(
+            fm_box,
+            text=("Windows: C:\\ffmpeg\\bin, Program Files\\ffmpeg\\bin e cartella "
+                  "ffmpeg accanto all'app vengono controllati automaticamente. "
+                  "La console CMD di FFmpeg resta nascosta."),
+            foreground=pal["fg"],
+            wraplength=1000,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # ---------- Download FFmpeg ----------
+        dl_box = ttk.LabelFrame(parent, text="🌐 Download FFmpeg", padding=10)
+        dl_box.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(
+            dl_box,
+            text=("FFmpeg non viene installato automaticamente: il pulsante apre la pagina ufficiale "
+                  "da cui scegliere un build Windows affidabile. Dopo l'installazione usa 'Rileva'."),
+            wraplength=1000,
+        ).pack(anchor="w")
+        dl_btns = ttk.Frame(dl_box)
+        dl_btns.pack(fill="x", pady=(7, 0))
+        ttk.Button(dl_btns, text="🌐 Apri pagina ufficiale FFmpeg",
+                   command=lambda: webbrowser.open(FFMPEG_DOWNLOAD_URL)).pack(side="left")
+        ttk.Button(dl_btns, text="🔎 Rileva dopo l'installazione",
+                   command=lambda: self.detect_ffmpeg(silent=False)).pack(side="left", padx=6)
+
+        # ---------- Utility rapide ----------
+        q_box = ttk.LabelFrame(parent, text="⚡ Utility rapide", padding=10)
+        q_box.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(
+            q_box,
+            text="Strumenti aggiuntivi per analisi e manutenzione senza modificare i file sorgente.",
+            foreground=pal["fg"],
+        ).pack(anchor="w")
+        q_btns = ttk.Frame(q_box)
+        q_btns.pack(fill="x", pady=(7, 0))
+        ttk.Button(q_btns, text="ℹ️ Info file selezionato",
+                   command=self.show_selected_media_info).pack(side="left")
+        ttk.Button(q_btns, text="🧹 Pulisci temporanei",
+                   command=self.cleanup_temp_files).pack(side="left", padx=6)
+        ttk.Button(q_btns, text="📂 Apri cartella log",
+                   command=self.open_log_folder).pack(side="left", padx=6)
+        ttk.Button(q_btns, text="📄 Salva report sessione",
+                   command=self.save_session_report).pack(side="left", padx=6)
+        ttk.Button(q_btns, text="📂 Apri output",
+                   command=self.open_output_folder).pack(side="left", padx=6)
+        ttk.Button(q_btns, text="📋 Copia comando FFmpeg",
+                   command=self.copy_current_ffmpeg_command).pack(side="left", padx=6)
+
+        # ---------- Tema GUI ----------
+        theme_box = ttk.LabelFrame(parent, text="Aspetto GUI", padding=10)
+        theme_box.pack(fill="x", padx=10, pady=(10, 6))
+        ttk.Label(theme_box, text="Tema:").pack(side="left")
+        self.theme_combo = ttk.Combobox(theme_box, textvariable=self.theme_var,
+                                         values=GUI_THEMES, state="readonly", width=18)
+        self.theme_combo.pack(side="left", padx=8)
+        self.theme_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_theme())
+        ttk.Button(theme_box, text="Applica", command=self.apply_theme).pack(side="left", padx=4)
+
+        # ---------- Preset nominati ----------
+        p_box = ttk.LabelFrame(parent, text="Preset nominati (max 5)", padding=10)
+        p_box.pack(fill="x", padx=10, pady=(10, 6))
+        p_box.columnconfigure(1, weight=1)
+
+        ttk.Label(p_box, text="Nome preset:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(p_box, textvariable=self.preset_name_var, width=30).grid(
+            row=0, column=1, sticky="ew", padx=8
+        )
+
+        p_btns = ttk.Frame(p_box)
+        p_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(p_btns, text="💾 Salva preset",
+                   command=self.save_preset).pack(side="left")
+        ttk.Button(p_btns, text="📂 Carica preset",
+                   command=self.load_preset).pack(side="left", padx=6)
+        ttk.Button(p_btns, text="🗑 Elimina preset",
+                   command=self.delete_preset).pack(side="left", padx=6)
+        ttk.Button(p_btns, text="🔄 Aggiorna lista",
+                   command=self.refresh_preset_list).pack(side="left", padx=6)
+
+        ttk.Label(p_box, text="Preset disponibili:").grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
+        self.preset_listbox = tk.Listbox(p_box, height=5)
+        self.preset_listbox.grid(row=3, column=0, columnspan=2,
+                                 sticky="ew", pady=(4, 0))
+
+        # ---------- Impostazioni globali ----------
+        s_box = ttk.LabelFrame(parent, text="⚙ Impostazioni generali", padding=10)
+        s_box.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(
+            s_box,
+            text="Gestisci, applica e verifica tutte le impostazioni della GUI in un unico punto.",
+            foreground=pal["fg"],
+        ).pack(anchor="w")
+
+        s_btns = ttk.Frame(s_box)
+        s_btns.pack(fill="x", pady=(8, 4))
+        ttk.Button(s_btns, text="💾 Salva impostazioni…",
+                   command=self.save_settings_dialog).pack(side="left")
+        ttk.Button(s_btns, text="📂 Carica impostazioni…",
+                   command=self.load_settings_dialog).pack(side="left", padx=6)
+        ttk.Button(s_btns, text="✅ Applica e carica impostazioni generali",
+                   command=self.apply_and_load_general_settings,
+                   style="Naplex.Accent.TButton").pack(side="left", padx=6)
+
+        s_btns2 = ttk.Frame(s_box)
+        s_btns2.pack(fill="x", pady=(2, 2))
+        ttk.Button(s_btns2, text="↺ Ripristina predefinite",
+                   command=self.reset_general_settings).pack(side="left")
+        ttk.Button(s_btns2, text="🔎 Verifica configurazione",
+                   command=self.validate_general_settings).pack(side="left", padx=6)
+        ttk.Button(s_btns2, text="📋 Riepilogo impostazioni",
+                   command=self.show_settings_summary).pack(side="left", padx=6)
+
+        ttk.Checkbutton(s_box, text="Carica automaticamente all'avvio",
+                        variable=self.autoload_settings).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(s_box, text="Salva automaticamente alla chiusura",
+                        variable=self.autosave_settings).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(s_box, text="Crea backup prima di applicare",
+                        variable=self.settings_auto_backup).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(s_box, text="Verifica la configurazione prima di applicare",
+                        variable=self.settings_validate_on_apply).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(s_box, textvariable=self.settings_status_var,
+                  foreground=pal["fg"]).pack(anchor="w", pady=(7, 0))
+        ttk.Label(s_box, text=f"File impostazioni generali: {DEFAULT_SETTINGS_FILE}",
+                  foreground=pal["fg"]).pack(anchor="w", pady=(3, 0))
+
+        # ---------- Diagnostica ----------
+        d_box = ttk.LabelFrame(parent, text="Diagnostica sistema", padding=10)
+        d_box.pack(fill="x", padx=10, pady=(0, 6))
+
+        d_btns = ttk.Frame(d_box)
+        d_btns.pack(fill="x")
+        ttk.Button(d_btns, text="🔬 Diagnostica FFmpeg",
+                   command=self.run_diagnostics).pack(side="left")
+        ttk.Button(d_btns, text="🎬 Prova 10s con codec corrente",
+                   command=self.run_benchmark).pack(side="left", padx=6)
+        ttk.Button(d_btns, text="📄 Esporta report",
+                   command=self.export_diagnostics).pack(side="left", padx=6)
+
+        # ---------- Export comandi ----------
+        e_box = ttk.LabelFrame(parent, text="Export comandi FFmpeg", padding=10)
+        e_box.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(
+            e_box,
+            text="Genera uno script .sh / .bat con tutti i comandi che verrebbero eseguiti.",
+            foreground=pal["fg"],
+        ).pack(anchor="w")
+
+        e_btns = ttk.Frame(e_box)
+        e_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(e_btns, text="🖥 Esporta script .sh",
+                   command=lambda: self.export_commands("sh")).pack(side="left")
+        ttk.Button(e_btns, text="🪟 Esporta script .bat",
+                   command=lambda: self.export_commands("bat")).pack(side="left",
+                                                                     padx=6)
+        ttk.Button(e_btns, text="📋 Copia negli appunti",
+                   command=self.copy_commands_to_clipboard).pack(side="left",
+                                                                 padx=6)
+
+        # ---------- Dry-run ----------
+        dr_box = ttk.LabelFrame(parent, text="Dry-run", padding=10)
+        dr_box.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(
+            dr_box,
+            text="Simula lo split senza eseguire FFmpeg: mostra i comandi, "
+                 "le dimensioni stimate e il numero di parti.",
+            foreground=pal["fg"],
+        ).pack(anchor="w")
+        ttk.Button(dr_box, text="🧪 Esegui dry-run",
+                   command=self.dry_run).pack(anchor="w", pady=(6, 0))
+
+        # Popola lista preset all'avvio
+        self.refresh_preset_list()
+
+    # =================================================================
+    # ===== TAB 5: CODA & RESUME ======================================
+    # =================================================================
+    def _build_tab_queue(self, parent):
+        box = ttk.LabelFrame(parent, text="Coda di elaborazione", padding=10)
+        box.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+
+        cols = ("file", "status", "parts", "progress", "error")
+        self.queue_tree = ttk.Treeview(box, columns=cols, show="headings", height=18)
+        headings = {"file":"File", "status":"Stato", "parts":"Parti", "progress":"Progress", "error":"Errore"}
+        widths = {"file":380, "status":130, "parts":80, "progress":90, "error":420}
+        for c in cols:
+            self.queue_tree.heading(c, text=headings[c])
+            self.queue_tree.column(c, width=widths[c], anchor="w")
+        ys = ttk.Scrollbar(box, orient="vertical", command=self.queue_tree.yview)
+        self.queue_tree.configure(yscrollcommand=ys.set)
+        self.queue_tree.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+
+        btn = ttk.Frame(parent)
+        btn.pack(fill="x", padx=10, pady=(0, 6))
+        for text, cmd in [
+            ("＋ Aggiungi file", self.queue_add_files),
+            ("📁 Dalla scansione", lambda: self.queue_from_tree(switch_tab=True)),
+            ("↑ Su", lambda: self.queue_move(-1)),
+            ("↓ Giù", lambda: self.queue_move(1)),
+            ("✕ Rimuovi", self.queue_remove),
+            ("🗑 Svuota lista", self.queue_clear),
+            ("↻ Retry errori", self.retry_failed_jobs),
+            ("💾 Salva coda", self.save_queue),
+            ("📂 Carica coda", self.load_queue),
+        ]:
+            ttk.Button(btn, text=text, command=cmd).pack(side="left", padx=(0, 5))
+
+        opt = ttk.LabelFrame(parent, text="Ripristino e verifica", padding=10)
+        opt.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Checkbutton(opt, text="Riprendi automaticamente parti già completate", variable=self.resume_enabled).pack(anchor="w")
+        ttk.Checkbutton(opt, text="Verifica ogni output con ffprobe", variable=self.verify_output).pack(anchor="w")
+        ttk.Checkbutton(opt, text="Genera SHA-256 per gli output verificati", variable=self.generate_hash).pack(anchor="w")
+        ttk.Checkbutton(opt, text="Proteggi l'input: non gestirlo finché TUTTE le parti non sono verificate", variable=self.protect_input).pack(anchor="w")
+        ttk.Checkbutton(opt, text="Retry automatico", variable=self.retry_enabled).pack(anchor="w")
+        row = ttk.Frame(opt); row.pack(fill="x", pady=(5,0))
+        ttk.Label(row, text="Tentativi massimi:").pack(side="left")
+        ttk.Spinbox(row, from_=0, to=10, width=5, textvariable=self.max_retries).pack(side="left", padx=6)
+        ttk.Label(row, text="Tolleranza durata (s):").pack(side="left", padx=(18,0))
+        ttk.Spinbox(row, from_=0.1, to=60, increment=0.5, width=7, textvariable=self.verify_duration_tolerance).pack(side="left", padx=6)
+
+        smart = ttk.LabelFrame(parent, text="Smart Encode", padding=10)
+        smart.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Checkbutton(smart, text="Abilita Smart Encode (solo se il codec è impostato su Copy)", variable=self.smart_encode).pack(anchor="w")
+        sr = ttk.Frame(smart); sr.pack(fill="x", pady=(6,0))
+        ttk.Label(sr, text="Profilo:").pack(side="left")
+        ttk.Combobox(sr, textvariable=self.smart_profile_var, values=list(SMART_PROFILES), state="readonly", width=18).pack(side="left", padx=6)
+        ttk.Label(sr, text="Lingue preferite (es. ita,eng):").pack(side="left", padx=(18,0))
+        ttk.Entry(sr, textvariable=self.preferred_languages_var, width=22).pack(side="left", padx=6)
+        ttk.Button(sr, text="🔎 Analizza selezionato", command=self.analyze_selected).pack(side="left", padx=6)
+        ttk.Button(sr, text="🩺 Pre-flight", command=self.preflight_check).pack(side="left", padx=6)
+        ttk.Button(sr, text="📊 Statistiche", command=self.show_statistics).pack(side="left", padx=6)
+
+    # =================================================================
+    # ===== v1.1 QUEUE =================================================
+    # =================================================================
+    def _new_job(self, src):
+        src = str(Path(src).resolve())
+        return {
+            "id": uuid.uuid4().hex[:12], "source": src, "status": "queued",
+            "parts_done": [], "parts_total": 0, "progress": 0.0,
+            "error": "", "created": datetime.now().isoformat(timespec="seconds"),
+            "started": None, "finished": None, "attempts": 0,
+        }
+
+    def queue_from_tree(self, switch_tab=False):
+        items = list(self.tree.get_children())
+        added = 0
+        with self.queue_lock:
+            existing = {j["source"] for j in self.queue_jobs.values()}
+            for iid in items:
+                src = str(Path(iid).resolve())
+                if src in existing or not Path(src).is_file():
+                    continue
+                j = self._new_job(src)
+                self.queue_jobs[j["id"]] = j
+                self.queue_order.append(j["id"])
+                added += 1
+        self.refresh_queue()
+        self.after(100, self.refresh_stream_inventory)
+        self.logmsg(f"Coda: aggiunti {added} job dalla scansione.", "info")
+        if switch_tab:
+            try:
+                self.notebook.select(self.tab_queue)
+            except Exception:
+                pass
+
+    def queue_add_files(self):
+        files = filedialog.askopenfilenames(title="Aggiungi video alla coda", filetypes=[("Video", "*.mkv *.mp4 *.m4v *.mov *.avi *.ts *.m2ts *.webm *.mpg *.mpeg"), ("Tutti", "*.*")])
+        with self.queue_lock:
+            existing = {j["source"] for j in self.queue_jobs.values()}
+            for f in files:
+                src = str(Path(f).resolve())
+                if src in existing:
+                    continue
+                j = self._new_job(src); self.queue_jobs[j["id"]] = j; self.queue_order.append(j["id"]); existing.add(src)
+        self.refresh_queue()
+        self.after(100, self.refresh_stream_inventory)
+
+    def queue_clear(self):
+        """Svuota completamente la coda senza toccare i file sorgente."""
+        with self.queue_lock:
+            count = len(self.queue_order)
+            self.queue_jobs.clear()
+            self.queue_order.clear()
+        self.refresh_queue()
+        self.after(100, self.refresh_stream_inventory)
+        self._save_queue_recovery()
+        self.logmsg(f"🗑 Coda svuotata: {count} job rimossi.", "info")
+
+    def queue_remove(self):
+        sel = self.queue_tree.selection()
+        with self.queue_lock:
+            for iid in sel:
+                self.queue_jobs.pop(iid, None)
+                if iid in self.queue_order: self.queue_order.remove(iid)
+        self.refresh_queue()
+        self.after(100, self.refresh_stream_inventory)
+
+    def queue_move(self, delta):
+        sel = self.queue_tree.selection()
+        if not sel: return
+        jid = sel[0]
+        with self.queue_lock:
+            try: i = self.queue_order.index(jid)
+            except ValueError: return
+            j = i + delta
+            if not 0 <= j < len(self.queue_order): return
+            self.queue_order[i], self.queue_order[j] = self.queue_order[j], self.queue_order[i]
+        self.refresh_queue(); self.queue_tree.selection_set(jid)
+
+    def refresh_queue(self):
+        def ui():
+            for iid in self.queue_tree.get_children(): self.queue_tree.delete(iid)
+            with self.queue_lock:
+                jobs = [(jid, self.queue_jobs[jid]) for jid in self.queue_order if jid in self.queue_jobs]
+            for jid, j in jobs:
+                done = len(j.get("parts_done", [])); total = j.get("parts_total", 0)
+                self.queue_tree.insert("", "end", iid=jid, values=(Path(j["source"]).name, j.get("status","queued"), f"{done}/{total or '-'}", f"{j.get('progress',0):.1f}%", j.get("error", "")))
+        self.after(0, ui)
+
+    def save_queue(self):
+        try:
+            with self.queue_lock:
+                data = {"_app":"FFmpeg Split GUI — naplex19", "_version":QUEUE_VERSION, "order":self.queue_order, "jobs":self.queue_jobs}
+            path = filedialog.asksaveasfilename(title="Salva coda", defaultextension=".json", initialfile="naplex19_queue.json", filetypes=[("JSON", "*.json")])
+            if not path: return
+            Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf8")
+            self.logmsg(f"✓ Coda salvata: {path}", "ok")
+        except Exception as e: messagebox.showerror("Coda", str(e))
+
+    def load_queue_file_silent(self, path=QUEUE_FILE):
+        try:
+            if not Path(path).exists(): return False
+            data = json.loads(Path(path).read_text(encoding="utf8"))
+            jobs = data.get("jobs", {})
+            order = data.get("order", list(jobs))
+            with self.queue_lock:
+                self.queue_jobs = jobs
+                self.queue_order = [x for x in order if x in jobs]
+            self.refresh_queue()
+            self.after(100, self.refresh_stream_inventory)
+            return True
+        except Exception as e:
+            self.logmsg(f"⚠ Recovery queue fallito: {e}", "warn")
+            return False
+
+    def load_queue(self):
+        path = filedialog.askopenfilename(title="Carica coda", filetypes=[("JSON", "*.json")])
+        if not path: return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf8"))
+            jobs = data.get("jobs", {})
+            order = data.get("order", list(jobs))
+            with self.queue_lock:
+                self.queue_jobs = jobs; self.queue_order = [x for x in order if x in jobs]
+            self.refresh_queue(); self.logmsg(f"✓ Coda caricata: {path}", "ok")
+        except Exception as e: messagebox.showerror("Coda", f"JSON non valido: {e}")
+
+    def retry_failed_jobs(self):
+        with self.queue_lock:
+            for j in self.queue_jobs.values():
+                if j.get("status") == "failed": j["status"]="queued"; j["error"]=""
+        self.refresh_queue(); self.logmsg("↻ Job falliti rimessi in coda.", "info")
+
+    def _set_job(self, src, **updates):
+        src = str(Path(src).resolve())
+        with self.queue_lock:
+            for j in self.queue_jobs.values():
+                if str(Path(j["source"]).resolve()) == src:
+                    j.update(updates); break
+        self.refresh_queue()
+
+    def _mark_part_done(self, src, part, total, output_size=0):
+        src = str(Path(src).resolve())
+        with self.queue_lock:
+            for j in self.queue_jobs.values():
+                if str(Path(j["source"]).resolve()) == src:
+                    done = set(j.get("parts_done", []))
+                    is_new = int(part) not in done
+                    done.add(int(part))
+                    j["parts_done"] = sorted(done)
+                    j["parts_total"] = max(int(total), int(j.get("parts_total",0)))
+                    j["progress"] = (len(done)/max(1,j["parts_total"]))*100
+                    j["status"]="encoding"
+                    break
+        with self._session_lock:
+            if 'is_new' in locals() and is_new:
+                self._session_parts += 1
+                self._session_output_bytes += int(output_size)
+                self._session_verified += 1 if self.verify_output.get() else 0
+        self.refresh_queue(); self._persist_queue_silent()
+
+    def _persist_queue_silent(self):
+        if not self.resume_enabled.get(): return
+        try:
+            with self.queue_lock:
+                data = {"_app":"FFmpeg Split GUI — naplex19", "_version":QUEUE_VERSION, "order":self.queue_order, "jobs":self.queue_jobs}
+            QUEUE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf8")
+        except Exception:
+            pass
+
+    def _resume_part_done(self, src, part):
+        if not self.resume_enabled.get(): return False
+        src = str(Path(src).resolve())
+        with self.queue_lock:
+            for j in self.queue_jobs.values():
+                if str(Path(j["source"]).resolve()) == src and int(part) in set(j.get("parts_done", [])):
+                    return True
+        return False
+
+    def wait_if_paused(self):
+        while self.running and not self.cancel_event.is_set() and not self.pause_event.is_set():
+            self.after(0, lambda: self.status.set("⏸ In pausa — attesa tra le parti…"))
+            time.sleep(0.25)
+
+    def toggle_pause(self):
+        if not self.running: return
+        if self.pause_event.is_set():
+            self.pause_event.clear(); self.pause_btn.configure(text="▶  Riprendi"); self.status.set("⏸ Pausa richiesta — terminerà la parte corrente."); self.logmsg("⏸ Pausa attivata.", "warn")
+        else:
+            self.pause_event.set(); self.pause_btn.configure(text="⏸  Pausa"); self.status.set("▶ Ripresa coda…"); self.logmsg("▶ Coda ripresa.", "ok")
+
+    def verify_output_file(self, src, final, expected_duration):
+        if not self.verify_output.get(): return {"verified": False, "sha256": None}
+        try:
+            if not final.exists() or final.stat().st_size <= 0: raise RuntimeError("Output mancante o vuoto")
+            info = ffprobe(final)
+            actual = float(info.get("format", {}).get("duration") or 0)
+            if actual <= 0: raise RuntimeError("Durata output non valida")
+            tol = float(self.verify_duration_tolerance.get())
+            # Per stream copy/trim FFmpeg può variare leggermente la durata.
+            if expected_duration > 0 and abs(actual - expected_duration) > max(tol, expected_duration*0.02):
+                raise RuntimeError(f"Durata inattesa: {actual:.2f}s contro {expected_duration:.2f}s")
+            streams = info.get("streams", [])
+            if not any(x.get("codec_type") == "video" for x in streams): raise RuntimeError("Nessun video nell'output")
+            digest = None
+            if self.generate_hash.get():
+                h=hashlib.sha256()
+                with open(final,"rb") as f:
+                    for chunk in iter(lambda:f.read(1024*1024), b""): h.update(chunk)
+                digest=h.hexdigest()
+            return {"verified": True, "sha256": digest, "duration": actual}
+        except Exception as e:
+            raise RuntimeError(f"Verifica output fallita: {e}")
+
+    def analyze_file(self, src):
+        info = ffprobe(Path(src)); fmt=info.get("format",{}); streams=info.get("streams",[])
+        v=next((x for x in streams if x.get("codec_type")=="video"),{})
+        aud=[x for x in streams if x.get("codec_type")=="audio"]
+        subs=[x for x in streams if x.get("codec_type")=="subtitle"]
+        dur=float(fmt.get("duration") or 0); size=Path(src).stat().st_size
+        return {"duration":dur,"size":size,"container":fmt.get("format_name",""),"video_codec":v.get("codec_name",""),"width":v.get("width"),"height":v.get("height"),"fps":v.get("r_frame_rate",""),"pix_fmt":v.get("pix_fmt",""),"hdr":is_hdr(info),"audio_count":len(aud),"subtitle_count":len(subs),"chapters":len(get_chapters(info))}
+
+    def analyze_selected(self):
+        sel=self.tree.selection()
+        src=Path(sel[0]) if sel else (Path(self.tree.get_children()[0]) if self.tree.get_children() else None)
+        if not src: messagebox.showinfo("Analisi", "Seleziona o scansiona un file."); return
+        try:
+            a=self.analyze_file(src)
+            text=(f"File: {src.name}\nContainer: {a['container']}\nVideo: {a['video_codec']}\n" f"Risoluzione: {a['width']}×{a['height']}\nFPS: {a['fps']}\nPixel: {a['pix_fmt']}\nHDR: {'sì' if a['hdr'] else 'no'}\n" f"Durata: {self._fmt_eta(a['duration'])}\nDimensione: {size_text(a['size'])}\nAudio: {a['audio_count']}\nSottotitoli: {a['subtitle_count']}\nCapitoli: {a['chapters']}")
+            messagebox.showinfo("Analisi v1.1", text)
+            self.logmsg("🔎 " + text.replace("\n", " | "), "info")
+        except Exception as e: messagebox.showerror("Analisi", str(e))
+
+    def preflight_check(self):
+        problems=[]; warnings=[]
+        if not shutil.which("ffmpeg"): problems.append("ffmpeg non trovato")
+        if not shutil.which("ffprobe"): problems.append("ffprobe non trovato")
+        if not self.output_dirs: warnings.append("Nessuna destinazione: verrà usata _SPLIT_OUTPUT")
+        if self.codec_var.get() not in CODEC_OPTIONS: problems.append("Codec video sconosciuto")
+        codec,is_gpu,is_copy=CODEC_OPTIONS[self.codec_var.get()]
+        if is_copy and (RESOLUTION_OPTIONS[self.resolution_var.get()] is not None or FPS_OPTIONS[self.fps_var.get()] is not None or self.hdr_tonemap.get() or self.denoise.get() or self.deinterlace.get()): problems.append("Copy incompatibile con filtri/ridimensionamento")
+        items=list(self.tree.get_children()) or [j["source"] for j in self.queue_jobs.values()]
+        if not items: warnings.append("Nessun file in coda")
+        for iid in items[:50]:
+            try:
+                p=Path(iid); ffprobe(p)
+            except Exception as e: problems.append(f"Input non leggibile: {Path(iid).name}: {e}")
+        msg="PREFLIGHT\n\n" + ("✓ Nessun problema bloccante\n" if not problems else "✗ Problemi:\n- "+"\n- ".join(problems)+"\n") + (("\n⚠ Avvisi:\n- "+"\n- ".join(warnings)) if warnings else "")
+        if problems: messagebox.showerror("Pre-flight", msg)
+        else: messagebox.showinfo("Pre-flight", msg)
+        return not problems
+
+    def show_statistics(self):
+        elapsed=(time.time()-self._session_started) if self._session_started else 0
+        with self._session_lock:
+            ib=self._session_input_bytes; ob=self._session_output_bytes; parts=self._session_parts; ver=self._session_verified
+        saving=(1-ob/ib)*100 if ib else 0
+        msg=(f"File OK: {self._ok_count}\nErrori: {self._err_count}\nParti: {parts}\nVerificate: {ver}\n\n" f"Input: {size_text(ib)}\nOutput: {size_text(ob)}\nRisparmio: {saving:.1f}%\nTempo sessione: {self._fmt_eta(elapsed)}")
+        messagebox.showinfo("Statistiche v1.1", msg)
+
+    # =================================================================
+    # ===== CALLBACK UI ===============================================
+    # =================================================================
+    def _parse_bitrate_text(self, value, maximum, label):
+        """Converte un bitrate inserito nella textbox in kbps.
+        Accetta: 5000, 5000k, 5M, 5 Mbps. Vuoto/0 = Auto.
+        """
+        text = str(value or "").strip().lower().replace(",", ".")
+        if not text:
+            return 0
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(kbps|k|mbps|m)?", text)
+        if not m:
+            raise ValueError(f"{label}: inserisci un numero in kbps (es. 5000) oppure Mbps (es. 5M).")
+        number = float(m.group(1))
+        unit = m.group(2) or "kbps"
+        kbps = int(round(number * 1000)) if unit in ("mbps", "m") else int(round(number))
+        if kbps < 0 or kbps > maximum:
+            raise ValueError(f"{label}: valore fuori intervallo (0-{maximum} kbps).")
+        return kbps
+
+    def get_video_bitrate(self):
+        return self._parse_bitrate_text(self.video_br_var.get(), 500000, "Bitrate video")
+
+    def get_audio_bitrate(self):
+        return self._parse_bitrate_text(self.audio_br_var.get(), 10000, "Bitrate audio")
+
+    def on_video_br_change(self, _value=None):
+        try:
+            v = self.get_video_bitrate()
+            self.video_br_label.set("Auto (CRF/CQ)" if v <= 0 else f"{v/1000:.2f} Mbps" if v >= 1000 else f"{v} kbps")
+        except ValueError:
+            self.video_br_label.set("Valore non valido")
+
+    def on_audio_br_change(self, _value=None):
+        try:
+            v = self.get_audio_bitrate()
+            self.audio_br_label.set("Auto (default codec)" if v <= 0 else f"{v} kbps")
+        except ValueError:
+            self.audio_br_label.set("Valore non valido")
+
+    def on_codec_change(self):
+        codec, is_gpu, is_copy = CODEC_OPTIONS[self.codec_var.get()]
+        state = "disabled" if is_copy else "normal"
+        self.video_br_scale.configure(state=state)
+        # NVENC preset attivo solo con nvenc
+        if codec in ("h264_nvenc", "hevc_nvenc"):
+            self.nvenc_preset_combo.configure(state="readonly")
+        else:
+            self.nvenc_preset_combo.configure(state="disabled")
+        if is_copy:
+            self.video_br_var.set("0")
+            self.video_br_label.set("N/D (Copy)")
+
+    def on_audio_change(self):
+        audio_codec, _ = AUDIO_OPTIONS[self.audio_var.get()]
+        state = "disabled" if audio_codec in (None, "copy", "flac") else "normal"
+        self.audio_br_scale.configure(state=state)
+        if audio_codec in (None, "copy"):
+            self.audio_br_var.set("0")
+            self.audio_br_label.set("N/D (Copy/none)")
+        elif audio_codec == "flac":
+            self.audio_br_var.set("0")
+            self.audio_br_label.set("N/D (lossless)")
+
+    def on_split_mode_change(self):
+        mode = SPLIT_MODE_OPTIONS[self.split_mode_var.get()]
+        # Attiva/disattiva widget
+        def set_state(widget, enabled):
+            try:
+                widget.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+
+        if mode == "none":
+            set_state(self.target_combo, False)
+            set_state(self.auto_target_combo, False)
+            set_state(self.duration_combo, False)
+            set_state(self.custom_duration_spin, False)
+            set_state(self.parts_combo, False)
+        elif mode == "size":
+            set_state(self.target_combo, True)
+            set_state(self.auto_target_combo, True)
+            set_state(self.duration_combo, False)
+            set_state(self.custom_duration_spin, False)
+            set_state(self.parts_combo, False)
+        elif mode == "duration":
+            set_state(self.target_combo, False)
+            set_state(self.auto_target_combo, False)
+            set_state(self.duration_combo, True)
+            set_state(self.custom_duration_spin, True)
+            set_state(self.parts_combo, False)
+        elif mode == "parts":
+            set_state(self.target_combo, False)
+            set_state(self.auto_target_combo, False)
+            set_state(self.duration_combo, False)
+            set_state(self.custom_duration_spin, False)
+            set_state(self.parts_combo, True)
+        elif mode == "chapters":
+            set_state(self.target_combo, False)
+            set_state(self.auto_target_combo, False)
+            set_state(self.duration_combo, False)
+            set_state(self.custom_duration_spin, False)
+            set_state(self.parts_combo, False)
+
+    def on_auto_target_change(self):
+        label = self.auto_target_var.get()
+        value = AUTO_TARGET_OPTIONS.get(label)
+        if value is not None:
+            mb = int(round(value / 1000**2))
+            # Seleziona il valore più vicino nei TARGET_OPTIONS
+            closest = min(TARGET_OPTIONS.keys(),
+                          key=lambda k: abs(TARGET_OPTIONS[k] - value))
+            self.target_var.set(closest)
+            self.logmsg(
+                f"Auto-target: {label} → ~{mb} MB (selezionato {closest})",
+                "info"
+            )
+        else:
+            self.logmsg("Auto-target: Custom (usa valore target manuale)", "info")
+
+    def on_duration_change(self):
+        sel = self.duration_var.get()
+        if DURATION_OPTIONS.get(sel) is None:
+            self.custom_duration_spin.configure(state="normal")
+        else:
+            self.custom_duration_spin.configure(state="disabled")
+
+    def on_rename_change(self):
+        sel = self.rename_part_var.get()
+        mode = RENAME_PART_OPTIONS.get(sel)
+        if mode == "custom":
+            self.rename_custom_entry.configure(state="normal")
+        else:
+            self.rename_custom_entry.configure(state="disabled")
+
+    def on_delete_mode_change(self):
+        mode = self.delete_mode_var.get()
+        if mode == "Sposta in cartella custom":
+            self.custom_trash_entry.configure(state="normal")
+        else:
+            self.custom_trash_entry.configure(state="disabled")
+
+    def on_output_ext_change(self):
+        val = self.output_ext_var.get()
+        if val == "Stessa del sorgente":
+            self.logmsg("Estensione output: STESSA del sorgente", "info")
+        else:
+            self.logmsg(f"Estensione output: {val}", "info")
+            codec, _is_gpu, is_copy = CODEC_OPTIONS[self.codec_var.get()]
+            if is_copy:
+                self.logmsg(
+                    "⚠ Con 'Copy' il cambio di estensione/container può fallire "
+                    "se i codec non sono compatibili.", "warn"
+                )
+
+    def on_auto_workers_change(self):
+        if self.auto_workers.get():
+            n = max(1, get_cpu_count() - 1)
+            self.parallel_workers.set(n)
+            self.workers_spin.configure(state="disabled")
+            self.logmsg(f"Auto-workers: {n} (core CPU - 1)", "info")
+        else:
+            self.workers_spin.configure(state="normal")
+
+    # =================================================================
+    # ===== LOGGING ====================================================
+    # =================================================================
+    def logmsg(self, msg, tag=None):
+        self.after(0, self._logmsg, msg, tag)
+
+    def _logmsg(self, msg, tag=None):
+        try:
+            if tag:
+                self.log.insert("end", msg + "\n", tag)
+            else:
+                self.log.insert("end", msg + "\n")
+            self.log.see("end")
+        except Exception:
+            pass
+
+    # =================================================================
+    # ===== GESTIONE OUTPUT ============================================
+    # =================================================================
+    def add_output(self):
+        p = filedialog.askdirectory(title="Aggiungi cartella di destinazione")
+        if p:
+            if p not in self.output_dirs:
+                self.output_dirs.append(p)
+                self.output_listbox.insert("end", p)
+                if not self.output.get():
+                    self.output.set(p)
+                self.logmsg(f"Output aggiunto: {p}", "info")
+
+    def remove_output(self):
+        sel = list(self.output_listbox.curselection())
+        for i in reversed(sel):
+            self.output_listbox.delete(i)
+            del self.output_dirs[i]
+        self.output.set(self.output_dirs[0] if self.output_dirs else "")
+        self.logmsg("Output rimosso.", "info")
+
+    def clear_outputs(self):
+        self.output_listbox.delete(0, "end")
+        self.output_dirs.clear()
+        self.output.set("")
+        self.logmsg("Lista output svuotata.", "info")
+
+    def next_output_dir(self):
+        if not self.output_dirs:
+            return None
+        with self._output_lock:
+            d = self.output_dirs[self._output_rr_index % len(self.output_dirs)]
+            self._output_rr_index += 1
+            return Path(d)
+
+    def _register_dnd_tree(self, widget):
+        """Registra DND sul contenitore e sui figli: il drop funziona anche sopra le Label interne."""
+        if not TKDND_OK:
+            return
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._handle_drop)
+            widget.dnd_bind("<<DragEnter>>", self._dnd_enter)
+            widget.dnd_bind("<<DragLeave>>", self._dnd_leave)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._register_dnd_tree(child)
+
+    def _dnd_enter(self, event=None):
+        self.dnd_status_var.set("Drag & Drop: rilascia qui file/cartella")
+        return None
+
+    def _dnd_leave(self, event=None):
+        self.dnd_status_var.set("Drag & Drop: attivo — file video o cartelle")
+        return None
+
+    def _initialize_drag_drop(self):
+        if TKDND_OK:
+            self.dnd_status_var.set("Drag & Drop: attivo — file video o cartelle")
+        else:
+            self.dnd_status_var.set("Drag & Drop: installa tkinterdnd2")
+
+    def _handle_drop(self, event):
+        """Riceve più percorsi, cartelle e video trascinati nella zona principale."""
+        try:
+            raw_paths = self.tk.splitlist(event.data)
+        except Exception:
+            raw = str(getattr(event, "data", "")).strip()
+            raw_paths = [raw.strip("{}") ] if raw else []
+
+        files, dirs = [], []
+        for raw in raw_paths:
+            try:
+                pth = Path(raw).expanduser().resolve()
+            except Exception:
+                continue
+            if pth.is_dir():
+                dirs.append(pth)
+            elif pth.is_file() and pth.suffix.lower() in VIDEO_EXT:
+                files.append(pth)
+
+        if dirs:
+            folder = dirs[0]
+            self.folder.set(str(folder))
+            try:
+                if not self.output.get():
+                    out = folder / "_OUTPUT"
+                    self.output.set(str(out))
+                    out.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            self.logmsg(f"↙ Drag & Drop cartella: {folder}", "info")
+            self.scan()
+
+        added = 0
+        if files:
+            with self.queue_lock:
+                existing = {j["source"] for j in self.queue_jobs.values()}
+                for src in files:
+                    key = str(src)
+                    if key in existing:
+                        continue
+                    job = self._new_job(src)
+                    self.queue_jobs[job["id"]] = job
+                    self.queue_order.append(job["id"])
+                    existing.add(key)
+                    added += 1
+            self.folder.set(str(files[0].parent))
+            self.refresh_queue()
+            self.logmsg(f"↙ Drag & Drop: {added} video aggiunti alla coda.", "info")
+
+        if not files and not dirs:
+            self.logmsg("⚠ Drag & Drop: nessun video o cartella valido.", "warn")
+        else:
+            self.after(250, self.refresh_stream_inventory)
+            if files and not dirs:
+                try:
+                    self.notebook.select(self.tab_queue)
+                except Exception:
+                    pass
+        self.dnd_status_var.set("Drag & Drop: ricevuto — pronto")
+        return "break"
+
+    def _dashboard_load_map(self):
+        self.load_map_streams()
+        self._open_map_manager()
+
+    def _open_map_manager(self):
+        """Apre la scheda Video & Audio sul manager MAP/Stream."""
+        try:
+            self.notebook.select(self.tab_av)
+            self.after(100, lambda: self.tab_av.canvas.yview_moveto(0.45))
+        except Exception:
+            pass
+
+    def choose_folder(self):
+        p = filedialog.askdirectory(title="Seleziona cartella sorgente")
+        if p:
+            self.folder.set(p)
+            if not self.output_dirs:
+                default = str(Path(p) / "_SPLIT_OUTPUT")
+                self.output_dirs.append(default)
+                self.output_listbox.insert("end", default)
+                self.output.set(default)
+            self.scan()
+
+    def choose_custom_trash_dir(self):
+        p = filedialog.askdirectory(title="Cartella custom per gli input")
+        if p:
+            self.custom_trash_dir.set(p)
+
+    def open_output(self):
+        sel = list(self.output_listbox.curselection())
+        if sel:
+            p = Path(self.output_dirs[sel[0]])
+        elif self.output_dirs:
+            p = Path(self.output_dirs[0])
+        else:
+            messagebox.showwarning("Output", "Aggiungi prima una cartella output.")
+            return
+        p.mkdir(parents=True, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(str(p))
+            elif os.name == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+
+    # =================================================================
+    # ===== SCAN =======================================================
+    # =================================================================
+    def compute_destination(self, src):
+        if self.smart_tv_paths.get() or self.detect_movies.get():
+            tv = parse_tv_filename(src.name)
+            if tv.get("is_tv"):
+                rel, _ = build_series_path(
+                    Path("."), tv, src.stem, structure="flat"
+                )
+                return rel.relative_to("."), str(rel.relative_to("."))
+            if self.detect_movies.get():
+                mv = parse_movie_filename(src.name)
+                if mv.get("is_movie"):
+                    rel, _ = build_series_path(
+                        Path("."), mv, src.stem, structure="movie"
+                    )
+                    return rel.relative_to("."), str(rel.relative_to("."))
+        return Path(sanitize_path_component(src.stem)), sanitize_path_component(src.stem)
+
+    def scan(self, open_queue=True):
+        if not self.folder.get():
+            messagebox.showwarning("Cartella", "Seleziona una cartella sorgente.")
+            return
+        root = Path(self.folder.get())
+        if not root.is_dir():
+            messagebox.showerror("Errore", "La cartella sorgente non esiste.")
+            return
+
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+        iterator = root.rglob("*") if self.recursive.get() else root.glob("*")
+        files = []
+        for p in iterator:
+            try:
+                if p.is_file() and p.suffix.lower() in VIDEO_EXT:
+                    files.append(p)
+            except OSError:
+                continue
+
+        files.sort()
+        tv_count = 0
+        movie_count = 0
+        over_count = 0
+
+        for p in files:
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            over = sz > THRESHOLD
+            if over:
+                over_count += 1
+            soglia_txt = ">4 GiB" if over else "<4 GiB"
+            _, dest_txt = self.compute_destination(p)
+            if parse_tv_filename(p.name).get("is_tv"):
+                tv_count += 1
+            elif parse_movie_filename(p.name).get("is_movie"):
+                movie_count += 1
+            self.tree.insert(
+                "", "end", iid=str(p),
+                values=(p.name, dest_txt, size_text(sz),
+                        soglia_txt, "-", "In coda")
+            )
+
+        self.current_progress.set(0)
+
+        # Dopo la scansione i video entrano AUTOMATICAMENTE nella Coda e Log.
+        # In questo modo la scansione non lascia i file soltanto nel Treeview.
+        self.queue_from_tree(switch_tab=False)
+
+        self.status.set(
+            f"Scansionati {len(files)} file video → {len(files)} inseriti nella Coda "
+            f"({over_count} oltre 4 GiB, {tv_count} serie TV, {movie_count} film)."
+        )
+        self.logmsg(
+            f"Scansione: {len(files)} file trovati e inseriti nella Coda "
+            f"({over_count} > 4 GiB, {tv_count} serie TV, {movie_count} film). "
+            f"Output: {len(self.output_dirs)} destinazione/i.",
+            "info"
+        )
+        if open_queue:
+            try:
+                self.notebook.select(self.tab_queue)
+            except Exception:
+                pass
+
+    # =================================================================
+    # ===== TREEVIEW HELPERS ==========================================
+    # =================================================================
+    def set_state(self, iid, text, parts=None):
+        def update():
+            try:
+                if iid in self.tree.get_children():
+                    vals = list(self.tree.item(iid, "values"))
+                    vals[5] = text
+                    if parts is not None:
+                        vals[4] = str(parts)
+                    self.tree.item(iid, values=vals)
+            except Exception:
+                pass
+        self.after(0, update)
+
+    # =================================================================
+    # ===== EXTRA ARGS =================================================
+    # =================================================================
+    def get_extra_args_from_text(self):
+        try:
+            raw = self.extra_args_text.get("1.0", "end").strip()
+        except Exception:
+            raw = ""
+        self.extra_args_var.set(raw)
+        try:
+            return parse_extra_args(raw), None
+        except ValueError as e:
+            return [], str(e)
+
+    def set_extra_args_text(self, text):
+        try:
+            self.extra_args_text.delete("1.0", "end")
+            if text:
+                self.extra_args_text.insert("1.0", text)
+        except Exception:
+            pass
+        self.extra_args_var.set(text or "")
+
+    # =================================================================
+    # ===== ESTENSIONE OUTPUT =========================================
+    # =================================================================
+    def effective_output_ext(self, src):
+        sel = self.output_ext_var.get()
+        if sel == "Stessa del sorgente":
+            return src.suffix
+        if not sel.startswith("."):
+            sel = "." + sel
+        return sel
+
+    # =================================================================
+    # ===== PRESET NOMINATI ============================================
+    # =================================================================
+    def refresh_preset_list(self):
+        try:
+            PRESET_FOLDER.mkdir(parents=True, exist_ok=True)
+            self.preset_listbox.delete(0, "end")
+            files = sorted(PRESET_FOLDER.glob("*.json"))
+            for f in files:
+                self.preset_listbox.insert("end", f.stem)
+        except Exception as e:
+            self.logmsg(f"⚠ Errore refresh preset: {e}", "warn")
+
+    def _preset_path(self, name):
+        safe = sanitize_path_component(name)
+        return PRESET_FOLDER / f"{safe}.json"
+
+    def save_preset(self):
+        name = self.preset_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Nome mancante", "Inserisci un nome per il preset.")
+            return
+        existing = [f.stem for f in PRESET_FOLDER.glob("*.json")]
+        if name not in existing and len(existing) >= MAX_PRESETS:
+            messagebox.showerror(
+                "Limite raggiunto",
+                f"Puoi salvare al massimo {MAX_PRESETS} preset. "
+                "Elimina un preset esistente per liberare spazio."
+            )
+            return
+        try:
+            data = self.to_dict()
+            with open(self._preset_path(name), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self.logmsg(f"✓ Preset salvato: {name}", "ok")
+            self.refresh_preset_list()
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+            self.logmsg(f"✗ Salvataggio preset fallito: {e}", "err")
+
+    def load_preset(self):
+        sel = self.preset_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("Nessun preset", "Seleziona un preset.")
+            return
+        name = self.preset_listbox.get(sel[0])
+        try:
+            with open(self._preset_path(name), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.from_dict(data)
+            self.logmsg(f"✓ Preset caricato: {name}", "ok")
+            self.preset_name_var.set(name)
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+            self.logmsg(f"✗ Caricamento preset fallito: {e}", "err")
+
+    def delete_preset(self):
+        sel = self.preset_listbox.curselection()
+        if not sel:
+            return
+        name = self.preset_listbox.get(sel[0])
+        if not messagebox.askyesno("Elimina preset", f"Eliminare il preset '{name}'?"):
+            return
+        try:
+            self._preset_path(name).unlink(missing_ok=True)
+            self.logmsg(f"✓ Preset eliminato: {name}", "ok")
+            self.refresh_preset_list()
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+
+    # =================================================================
+    # ===== DIAGNOSTICA ================================================
+    # =================================================================
+    def run_diagnostics(self):
+        threading.Thread(target=self._diagnostics_worker, daemon=True).start()
+
+    def _diagnostics_worker(self):
+        self.logmsg("\n=== DIAGNOSTICA SISTEMA ===", "head")
+
+        # ffmpeg -version
+        rc, out, err = run(["ffmpeg", "-version"])
+        if rc == 0:
+            first = out.splitlines()[0] if out else "(nessuna info)"
+            self.logmsg(f"FFmpeg: {first}", "info")
+        else:
+            self.logmsg(f"✗ FFmpeg non trovato: {err}", "err")
+            return
+
+        # ffprobe
+        rc, out, _ = run(["ffprobe", "-version"])
+        if rc == 0:
+            first = out.splitlines()[0] if out else "(nessuna info)"
+            self.logmsg(f"ffprobe: {first}", "info")
+
+        # encoders chiave
+        key_codecs = [
+            "libx264", "libx265", "h264_nvenc", "hevc_nvenc",
+            "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf",
+            "aac", "libopus", "libmp3lame", "ac3", "eac3", "flac",
+        ]
+        rc, out, _ = run(["ffmpeg", "-hide_banner", "-encoders"])
+        if rc == 0:
+            self._ffmpeg_encoders = out
+            available = [c for c in key_codecs if c in out]
+            missing = [c for c in key_codecs if c not in out]
+            self.logmsg(f"Encoder disponibili: {', '.join(available) or '(nessuno)'}", "ok")
+            if missing:
+                self.logmsg(f"Encoder mancanti: {', '.join(missing)}", "warn")
+
+        # filtri chiave
+        key_filters = ["subtitles", "scale", "fps", "hqdn3d",
+                       "yadif", "zscale", "tonemap", "loudnorm"]
+        rc, out, _ = run(["ffmpeg", "-hide_banner", "-filters"])
+        if rc == 0:
+            self._ffmpeg_filters = out
+            avail = [f for f in key_filters if re.search(rf"\b{f}\b", out)]
+            missing = [f for f in key_filters if f not in avail]
+            self.logmsg(f"Filtri disponibili: {', '.join(avail) or '(nessuno)'}", "ok")
+            if missing:
+                self.logmsg(f"Filtri mancanti: {', '.join(missing)}", "warn")
+
+        # CPU / RAM / disco
+        self.logmsg(f"CPU cores: {get_cpu_count()}", "info")
+        if PSUTIL_OK:
+            try:
+                mem = psutil.virtual_memory()
+                self.logmsg(
+                    f"RAM: {mem.total / 1024**3:.1f} GiB totali, "
+                    f"{mem.available / 1024**3:.1f} GiB disponibili",
+                    "info"
+                )
+            except Exception:
+                pass
+
+        # Dipendenze opzionali
+        self.logmsg(
+            f"send2trash: {'✓' if SEND2TRASH_OK else '✗'}   "
+            f"plyer: {'✓' if PLYER_OK else '✗'}   "
+            f"psutil: {'✓' if PSUTIL_OK else '✗'}",
+            "info"
+        )
+
+        self.logmsg("=== FINE DIAGNOSTICA ===\n", "head")
+
+    def export_diagnostics(self):
+        if not self._ffmpeg_encoders:
+            messagebox.showinfo("Diagnostica",
+                                "Esegui prima 'Diagnostica FFmpeg'.")
+            return
+        p = filedialog.asksaveasfilename(
+            title="Salva report diagnostica",
+            defaultextension=".txt",
+            initialfile="ffmpeg_diagnostics.txt",
+            filetypes=[("Testo", "*.txt"), ("Tutti i file", "*.*")]
+        )
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(f"FFmpeg Split GUI v{SETTINGS_VERSION} — Report diagnostica\n")
+                f.write(f"Data: {datetime.now().isoformat()}\n\n")
+                f.write("=== ENCODERS ===\n")
+                f.write(self._ffmpeg_encoders or "(n/d)")
+                f.write("\n\n=== FILTRI ===\n")
+                f.write(self._ffmpeg_filters or "(n/d)")
+            self.logmsg(f"✓ Report salvato: {p}", "ok")
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+
+    def run_benchmark(self):
+        # Benchmark veloce su primo file in lista, 10s
+        items = self.tree.get_children()
+        if not items:
+            messagebox.showinfo("Benchmark", "Nessun file in lista.")
+            return
+        src = Path(items[0])
+        codec, _is_gpu, is_copy = CODEC_OPTIONS[self.codec_var.get()]
+        if is_copy:
+            messagebox.showinfo("Benchmark",
+                                "Benchmark non disponibile in modalità Copy.")
+            return
+        self.logmsg(f"\n=== BENCHMARK 10s — {src.name} ({codec}) ===", "head")
+        threading.Thread(target=self._benchmark_worker,
+                         args=(src, codec), daemon=True).start()
+
+    def _benchmark_worker(self, src, codec):
+        tmp = src.parent / f".naplex19_bench_{int(time.time())}.mkv"
+        try:
+            cmd = [
+                "ffmpeg", "-hide_banner", "-y",
+                "-ss", "60", "-i", str(src), "-t", "10",
+                "-c:v", codec,
+                "-f", "null", "-"
+            ]
+            t0 = time.time()
+            rc, _, err = run(cmd, timeout=300)
+            elapsed = time.time() - t0
+            if rc == 0:
+                self.logmsg(
+                    f"✓ Benchmark {codec}: 10s processati in {elapsed:.1f}s "
+                    f"(speed ≈ {10/elapsed:.2f}x)",
+                    "ok"
+                )
+            else:
+                self.logmsg(f"✗ Benchmark fallito: {err[:300]}", "err")
+        except Exception as e:
+            self.logmsg(f"✗ Benchmark errore: {e}", "err")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    # =================================================================
+    # ===== EXPORT COMANDI ============================================
+    # =================================================================
+    def _collect_commands(self):
+        """
+        Ricostruisce i comandi FFmpeg che verrebbero eseguiti,
+        senza eseguirli. Ritorna lista di tuple (label, cmd_list).
+        """
+        items = list(self.tree.get_children())
+        if not items:
+            return []
+        out = []
+        codec, is_gpu, is_copy = CODEC_OPTIONS[self.codec_var.get()]
+        # Smart Encode: attivo solo se richiesto e se l'utente ha lasciato Copy.
+        if self.smart_encode.get() and is_copy:
+            profile = self.smart_profile_var.get()
+            if profile == "Archivio":
+                codec, is_gpu, is_copy = "libx265", False, False
+                self.logmsg("🧠 Smart Encode → H.265 CPU / archivio", "info")
+            elif profile == "Velocità":
+                codec, is_gpu, is_copy = "libx264", False, False
+                self.encoder_preset_var.set("veryfast")
+                self.logmsg("🧠 Smart Encode → H.264 CPU / velocità", "info")
+            elif profile == "TV":
+                codec, is_gpu, is_copy = "libx264", False, False
+                self.resolution_var.set("1080p")
+                self.audio_var.set("AAC")
+                self.opt_pix_fmt_yuv420p.set(True)
+                self.logmsg("🧠 Smart Encode → profilo TV", "info")
+            elif profile == "Compressione":
+                codec, is_gpu, is_copy = "libx265", False, False
+                self.crf_var.set(max(22, int(self.crf_var.get())))
+                self.logmsg("🧠 Smart Encode → H.265 / compressione", "info")
+            else:
+                # Smart conservativo: Copy per sorgenti già codificate e senza filtri.
+                self.logmsg("🧠 Smart Encode → Copy conservativo", "info")
+        audio_codec, _ = AUDIO_OPTIONS[self.audio_var.get()]
+        res_h = RESOLUTION_OPTIONS[self.resolution_var.get()]
+        fps_val = FPS_OPTIONS[self.fps_var.get()]
+        sub_mode = SUBTITLE_OPTIONS[self.subtitle_var.get()]
+        v_br = self.get_video_bitrate()
+        a_br = self.get_audio_bitrate()
+        extra_args, _ = self.get_extra_args_from_text()
+
+        for iid in items:
+            src = Path(iid)
+            try:
+                info = ffprobe(src)
+            except Exception:
+                continue
+            duration = float(info.get("format", {}).get("duration") or 0)
+            if duration <= 0:
+                continue
+            title = title_from_info(info) or src.stem
+            subs_present = has_subtitles(info)
+            out_ext = self.effective_output_ext(src)
+
+            outdir, _ = self.output_dir_for(src, src)
+            # Split in 2 parti (demo)
+            half = duration / 2
+            for i, start in enumerate([0.0, half], 1):
+                tmp = outdir / f"{src.stem}.part{i:03d}{out_ext}"
+                cmd = self.build_ffmpeg_cmd(
+                    src, tmp, start, half, title,
+                    codec, is_gpu, is_copy,
+                    audio_codec_eff, a_br,
+                    res_h, fps_val,
+                    sub_mode, subs_present,
+                    v_br, info, extra_args
+                )
+                out.append((f"{src.name} — parte {i:02d}", cmd))
+        return out
+
+    def export_commands(self, fmt="sh"):
+        cmds = self._collect_commands()
+        if not cmds:
+            messagebox.showinfo("Export", "Nessun comando da esportare.")
+            return
+        ext = ".sh" if fmt == "sh" else ".bat"
+        p = filedialog.asksaveasfilename(
+            title=f"Esporta script {fmt}",
+            defaultextension=ext,
+            initialfile=f"split_commands{ext}",
+            filetypes=[("Script", f"*{ext}"), ("Tutti i file", "*.*")]
+        )
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                if fmt == "sh":
+                    f.write("#!/usr/bin/env bash\n")
+                    f.write("set -e\n\n")
+                else:
+                    f.write("@echo off\n\n")
+                for label, cmd in cmds:
+                    f.write(f"REM {label}\n" if fmt == "bat" else f"# {label}\n")
+                    if fmt == "bat":
+                        # Quote robusto per Windows batch.
+                        parts = []
+                        for c in cmd:
+                            s = str(c)
+                            if any(ch in s for ch in ' 	&()[]{}^=;!\''):
+                                s = '"' + s.replace('"', '""') + '"'
+                            parts.append(s)
+                        f.write(" ".join(parts) + "\n\n")
+                    else:
+                        f.write(" ".join(shlex.quote(str(c)) for c in cmd) + "\n\n")
+            self.logmsg(f"✓ Script esportato: {p}", "ok")
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+
+    def copy_commands_to_clipboard(self):
+        cmds = self._collect_commands()
+        if not cmds:
+            return
+        text = "\n".join(" ".join(shlex.quote(str(c)) for c in cmd)
+                         for _, cmd in cmds)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.logmsg("✓ Comandi copiati negli appunti.", "ok")
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+
+    # =================================================================
+    # ===== DRY RUN ====================================================
+    # =================================================================
+    def dry_run(self):
+        items = list(self.tree.get_children())
+        if not items:
+            messagebox.showinfo("Dry-run", "Nessun file in lista.")
+            return
+        cmds = self._collect_commands()
+        if not cmds:
+            messagebox.showinfo("Dry-run", "Nessun comando generato.")
+            return
+        self.logmsg(f"\n=== DRY-RUN: {len(cmds)} comandi generati ===", "head")
+        for label, cmd in cmds:
+            self.logmsg(f"• {label}", "info")
+            self.logmsg(f"  {' '.join(str(c) for c in cmd)[:240]}...", None)
+        self.logmsg("=== FINE DRY-RUN ===\n", "head")
+
+    # =================================================================
+    # ===== PERSISTENZA IMPOSTAZIONI ==================================
+    # =================================================================
+    def save_settings(self, path, silent=False):
+        data = self.to_dict()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        if not silent:
+            self.logmsg(f"✓ Impostazioni salvate in {path}", "ok")
+            self.status.set(f"Impostazioni salvate: {path}")
+        return True
+
+    def load_settings(self, path, silent=False):
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"File non trovato: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ver = data.get("_version", "?")
+        self.from_dict(data)
+        if not silent:
+            self.logmsg(f"✓ Impostazioni caricate da {path} (v{ver})", "ok")
+            self.status.set(f"Impostazioni caricate: {path}")
+        return data
+
+    def save_settings_dialog(self):
+        p = filedialog.asksaveasfilename(
+            title="Salva impostazioni come…",
+            defaultextension=".json",
+            initialfile=DEFAULT_SETTINGS_FILE.name,
+            initialdir=str(DEFAULT_SETTINGS_FILE.parent),
+            filetypes=[("JSON", "*.json"), ("Tutti i file", "*.*")]
+        )
+        if not p:
+            return
+        try:
+            self.save_settings(p)
+        except Exception as e:
+            messagebox.showerror("Errore salvataggio", str(e))
+
+    def load_settings_dialog(self):
+        p = filedialog.askopenfilename(
+            title="Carica impostazioni da…",
+            defaultextension=".json",
+            initialdir=str(DEFAULT_SETTINGS_FILE.parent),
+            filetypes=[("JSON", "*.json"), ("Tutti i file", "*.*")]
+        )
+        if not p:
+            return
+        try:
+            self.load_settings(p)
+        except Exception as e:
+            messagebox.showerror("Errore caricamento", str(e))
+
+    def apply_settings(self):
+        """Compatibilità: applica il file generale predefinito."""
+        return self.apply_and_load_general_settings()
+
+    def _settings_backup_path(self):
+        return DEFAULT_SETTINGS_FILE.with_suffix(DEFAULT_SETTINGS_FILE.suffix + ".bak")
+
+    def _make_settings_backup(self):
+        if not DEFAULT_SETTINGS_FILE.exists():
+            return None
+        backup = self._settings_backup_path()
+        try:
+            import shutil
+            shutil.copy2(DEFAULT_SETTINGS_FILE, backup)
+            return backup
+        except Exception as e:
+            self.logmsg(f"⚠ Backup impostazioni non creato: {e}", "warn")
+            return None
+
+    def validate_general_settings(self, silent=False):
+        """Controlla i valori principali senza modificare la configurazione."""
+        errors = []
+        warnings = []
+
+        try:
+            crf = int(self.crf_var.get())
+            if not 0 <= crf <= 51:
+                errors.append("CRF deve essere compreso tra 0 e 51.")
+        except Exception:
+            errors.append("CRF non valido.")
+
+        try:
+            workers = int(self.parallel_workers.get())
+            if not 1 <= workers <= 16:
+                errors.append("I worker paralleli devono essere tra 1 e 16.")
+        except Exception:
+            errors.append("Numero worker non valido.")
+
+        try:
+            retries = int(self.max_retries.get())
+            if not 0 <= retries <= 10:
+                errors.append("I tentativi automatici devono essere tra 0 e 10.")
+        except Exception:
+            errors.append("Numero tentativi non valido.")
+
+        if self.ffmpeg_autodetect.get() is False and not self.ffmpeg_path_var.get().strip():
+            warnings.append("Rilevamento FFmpeg disattivato ma non è stato indicato un percorso.")
+
+        if self.overwrite.get() and self.skip_existing.get():
+            warnings.append("Sovrascrittura e salto dei file esistenti sono entrambi attivi.")
+
+        if errors:
+            msg = "Configurazione non valida:\n\n• " + "\n• ".join(errors)
+            if not silent:
+                messagebox.showerror("Verifica impostazioni", msg)
+            self.settings_status_var.set("❌ Configurazione non valida")
+            return False
+
+        msg = "Configurazione valida."
+        if warnings:
+            msg += "\n\nAvvisi:\n• " + "\n• ".join(warnings)
+        if not silent:
+            messagebox.showwarning("Verifica impostazioni", msg) if warnings else messagebox.showinfo("Verifica impostazioni", msg)
+        self.settings_status_var.set("✓ Configurazione verificata")
+        return True
+
+    def apply_and_load_general_settings(self):
+        """Salva la configurazione corrente e la ricarica come impostazioni generali."""
+        if self.settings_validate_on_apply.get() and not self.validate_general_settings(silent=True):
+            messagebox.showerror("Impostazioni", "Correggi gli errori di configurazione prima di applicare.")
+            return False
+
+        try:
+            backup = self._make_settings_backup() if self.settings_auto_backup.get() else None
+            self.save_settings(DEFAULT_SETTINGS_FILE, silent=True)
+            self.load_settings(DEFAULT_SETTINGS_FILE, silent=True)
+            self.settings_status_var.set("✓ Impostazioni generali applicate e caricate")
+            self.status.set("Impostazioni generali applicate")
+            self.logmsg("✓ Impostazioni generali applicate e ricaricate.", "ok")
+            if backup:
+                self.logmsg(f"✓ Backup creato: {backup}", "info")
+            return True
+        except Exception as e:
+            self.settings_status_var.set("❌ Applicazione impostazioni fallita")
+            self.logmsg(f"✗ Applicazione impostazioni fallita: {e}", "err")
+            messagebox.showerror("Errore impostazioni", str(e))
+            return False
+
+    def reset_general_settings(self):
+        """Ripristina una configurazione sicura di base senza cancellare i preset."""
+        if not messagebox.askyesno(
+            "Ripristina impostazioni",
+            "Ripristinare le impostazioni generali ai valori sicuri predefiniti?\n\nI preset salvati non verranno eliminati."
+        ):
+            return
+
+        defaults = {
+            "recursive": True, "only_over_4gib": False, "smart_tv_paths": True,
+            "detect_movies": True, "folder_structure": list(FOLDER_STRUCTURE_OPTIONS)[0],
+            "theme": "Bianco", "ffmpeg_autodetect": True,
+            "split_mode": "Per dimensione (MB)", "target": "2500 MB",
+            "auto_target": "Custom (usa valore sopra)", "duration": "30 min",
+            "parts_n": "2", "codec": "Copy (no re-encode)",
+            "encoder_preset": "veryfast", "nvenc_preset": "p4",
+            "tune": "(nessuno)", "resolution": "Originale", "fps": "Originale",
+            "audio_codec": "Copy (originale)", "subtitle_mode": "Copia (default - infer_no_sub)",
+            "output_ext": "Stessa del sorgente", "overwrite": False, "skip_existing": True,
+            "copy_metadata": True, "delete_input_after": False, "auto_workers": False,
+            "parallel_workers": 1, "threads": "Auto", "priority": "Normale",
+            "fallback_nvenc": True, "check_disk_space": True, "save_log_csv": True,
+            "save_log_json": False, "notify_desktop": PLYER_OK, "autoload_settings": True,
+            "autosave_settings": True, "resume_enabled": True, "verify_output": True,
+            "retry_enabled": True, "max_retries": 2, "smart_encode": False,
+            "smart_profile": "Smart", "preferred_languages": "ita,eng",
+            "generate_hash": False, "protect_input": True, "auto_start_queue": False,
+        }
+        try:
+            self.from_dict(defaults)
+            self.save_settings(DEFAULT_SETTINGS_FILE, silent=True)
+            self.settings_status_var.set("↺ Impostazioni predefinite ripristinate")
+            self.status.set("Impostazioni predefinite ripristinate")
+            self.logmsg("↺ Impostazioni generali ripristinate ai valori sicuri.", "info")
+        except Exception as e:
+            messagebox.showerror("Errore ripristino", str(e))
+
+    def show_settings_summary(self):
+        """Mostra un riepilogo leggibile della configurazione attuale."""
+        try:
+            data = self.to_dict()
+            lines = [
+                f"Tema: {data.get('theme')}",
+                f"FFmpeg: {data.get('ffmpeg_path') or 'auto-detect'}",
+                f"Split: {data.get('split_mode')}",
+                f"Video: {data.get('codec')} | {data.get('resolution')} | FPS {data.get('fps')}",
+                f"Audio: {data.get('audio_codec')} | {data.get('audio_bitrate_kbps')} kbps",
+                f"Sottotitoli: {data.get('subtitle_mode')}",
+                f"Worker: {'auto' if data.get('auto_workers') else data.get('parallel_workers')}",
+                f"Resume: {'ON' if data.get('resume_enabled') else 'OFF'} | Verifica: {'ON' if data.get('verify_output') else 'OFF'}",
+                f"Smart Encode: {'ON' if data.get('smart_encode') else 'OFF'}",
+                f"Lingue preferite: {data.get('preferred_languages')}",
+                f"File impostazioni: {DEFAULT_SETTINGS_FILE}",
+            ]
+            messagebox.showinfo("Riepilogo impostazioni", "\n".join(lines))
+            self.settings_status_var.set("✓ Riepilogo visualizzato")
+        except Exception as e:
+            messagebox.showerror("Errore riepilogo", str(e))
+
+        # =================================================================
+    # ===== START / CANCEL ============================================
+    # =================================================================
+    def start(self):
+        if self.running:
+            return
+
+        # ---------- v1.1: la coda può essere indipendente dalla cartella ----------
+        if not self.queue_jobs:
+            if not self.folder.get() or not Path(self.folder.get()).is_dir():
+                messagebox.showwarning("Sorgente", "Seleziona una cartella sorgente.")
+                return
+        elif not self.folder.get():
+            self.folder.set(str(Path(next(iter(self.queue_jobs.values()))["source"]).parent))
+
+        if not self.preflight_check():
+            return
+        if not self.detect_ffmpeg(silent=True):
+            messagebox.showerror(
+                "FFmpeg non trovato",
+                "FFmpeg/ffprobe non sono disponibili. Usa la tab 'Preset & Utility' → "
+                "'FFmpeg Manager' per selezionare ffmpeg.exe oppure aprire il sito ufficiale."
+            )
+            return
+
+        # ---------- Output default ----------
+        if not self.output_dirs:
+            default = str(Path(self.folder.get()) / "_SPLIT_OUTPUT")
+            self.output_dirs.append(default)
+            self.output_listbox.insert("end", default)
+            self.output.set(default)
+
+        # ---------- Lista file ----------
+        if self.queue_jobs:
+            with self.queue_lock:
+                items = [self.queue_jobs[jid]["source"] for jid in self.queue_order if jid in self.queue_jobs]
+        else:
+            items = list(self.tree.get_children())
+            if not items:
+                self.scan(open_queue=False)
+                items = list(self.tree.get_children())
+            if items:
+                self.queue_from_tree()
+        if not items:
+            messagebox.showinfo("Niente da fare", "Nessun file video trovato.")
+            return
+
+        # ---------- Filtro >4GiB ----------
+        if self.only_over_4gib.get():
+            filtered = []
+            for iid in items:
+                try:
+                    if Path(iid).stat().st_size > THRESHOLD:
+                        filtered.append(iid)
+                except OSError:
+                    continue
+            items = filtered
+            if not items:
+                messagebox.showinfo("Niente da fare",
+                                    "Nessun file oltre 4 GiB (filtro attivo).")
+                return
+
+        # ---------- Validazione codec/filtri ----------
+        codec, is_gpu, is_copy = CODEC_OPTIONS[self.codec_var.get()]
+        sub_mode = SUBTITLE_OPTIONS[self.subtitle_var.get()]
+        res = RESOLUTION_OPTIONS[self.resolution_var.get()]
+        fps = FPS_OPTIONS[self.fps_var.get()]
+
+        if is_copy and (res is not None or fps is not None or sub_mode == "burn"
+                        or self.denoise.get() or self.deinterlace.get()
+                        or self.hdr_tonemap.get()):
+            messagebox.showerror(
+                "Configurazione non valida",
+                "Risoluzione, FPS, burn-in sottotitoli, denoise, deinterlace e "
+                "tonemap HDR richiedono un codec video diverso da 'Copy'."
+            )
+            return
+
+        # ---------- Avviso Copy + container diverso ----------
+        if is_copy and self.output_ext_var.get() != "Stessa del sorgente":
+            if not messagebox.askyesno(
+                "Cambio container con Copy",
+                f"Hai selezionato 'Copy' ma un'estensione di output diversa "
+                f"({self.output_ext_var.get()}).\n\n"
+                "Questo può fallire se i codec non sono compatibili.\n"
+                "Procedere comunque?"
+            ):
+                return
+
+        # ---------- Extra args ----------
+        extra_args, err = self.get_extra_args_from_text()
+        if err:
+            messagebox.showerror("Argomenti extra non validi", err)
+            return
+
+        # ---------- Conferma delete input ----------
+        if self.delete_input_after.get():
+            mode = self.delete_mode_var.get()
+            if mode == "Elimina definitivamente":
+                if not messagebox.askyesno(
+                    "⚠ ELIMINAZIONE DEFINITIVA",
+                    "Hai attivato l'eliminazione DEFINITIVA dei file di INPUT.\n"
+                    "Questa operazione è IRREVERSIBILE.\n\nProcedere?"
+                ):
+                    return
+            else:
+                if not messagebox.askyesno(
+                    "Gestione input dopo encoding",
+                    f"Modalità: {mode}\n\n"
+                    "I file di input verranno spostati/eliminati dopo ogni "
+                    "encoding riuscito.\n\nProcedere?"
+                ):
+                    return
+
+        # ---------- Check spazio disco ----------
+        if self.check_disk_space.get():
+            total_needed = 0
+            for iid in items:
+                try:
+                    total_needed += Path(iid).stat().st_size
+                except OSError:
+                    pass
+            # margine 15%
+            total_needed = int(total_needed * 1.15)
+            for d in self.output_dirs:
+                ok, free = check_disk_space(d, total_needed)
+                if not ok and free >= 0:
+                    msg = (
+                        f"Spazio disco insufficiente in:\n{d}\n\n"
+                        f"Richiesto: ~{size_text(total_needed)}\n"
+                        f"Disponibile: {size_text(free)}\n\n"
+                        "Vuoi procedere comunque?"
+                    )
+                    if not messagebox.askyesno("Spazio disco", msg):
+                        return
+
+        # ---------- Verifica encoder ----------
+        self.check_ffmpeg_codecs(codec)
+
+        # ---------- Crea cartelle output ----------
+        for d in self.output_dirs:
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+        # ---------- Avvio ----------
+        self._ok_count = 0
+        self._err_count = 0
+        self.log_rows = []
+        self.cancel_event.clear()
+        self.pause_event.set()
+        self.running = True
+        self._session_started = time.time()
+        self._session_input_bytes = sum((Path(i).stat().st_size for i in items if Path(i).exists()), 0)
+        self._session_output_bytes = 0
+        self._session_parts = 0
+        self._session_verified = 0
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.pause_btn.configure(state="normal", text="⏸  Pausa")
+
+        workers = max(1, int(self.parallel_workers.get()))
+        threading.Thread(
+            target=self.worker, args=(items, workers), daemon=True
+        ).start()
+
+    def _register_ffmpeg_process(self, proc):
+        with self._ffmpeg_process_lock:
+            self._ffmpeg_processes.add(proc)
+
+    def _unregister_ffmpeg_process(self, proc):
+        with self._ffmpeg_process_lock:
+            self._ffmpeg_processes.discard(proc)
+
+    def _terminate_active_ffmpeg_processes(self):
+        with self._ffmpeg_process_lock:
+            processes = list(self._ffmpeg_processes)
+        for proc in processes:
+            _terminate_process_tree(proc, grace=1.0)
+        if processes:
+            self.logmsg(f"■ FFmpeg: terminati {len(processes)} processo/i e relativi figli.", "warn")
+
+    def cancel_work(self):
+        if not self.running:
+            return
+        if not messagebox.askyesno(
+            "Annulla operazione",
+            "Fermare l'encoding? Le parti in corso verranno terminate."
+        ):
+            return
+        self.cancel_event.set()
+        self._terminate_active_ffmpeg_processes()
+        self.logmsg("■ Annullamento richiesto: stop del processo FFmpeg e dell'albero figli.", "warn")
+        self.status.set("Annullamento in corso…")
+
+    # =================================================================
+    # ===== CHECK ENCODER =============================================
+    # =================================================================
+    def check_ffmpeg_codecs(self, video_codec):
+        if video_codec == "copy":
+            return True
+        try:
+            rc, out, _ = run(["ffmpeg", "-hide_banner", "-encoders"])
+            if rc != 0:
+                self.logmsg("⚠ Impossibile verificare gli encoder.", "warn")
+                return True
+            if video_codec in out:
+                self.logmsg(f"✓ Encoder '{video_codec}' disponibile.", "ok")
+                return True
+            self.logmsg(
+                f"✗ Encoder '{video_codec}' NON trovato in questa build di FFmpeg.",
+                "err"
+            )
+            return False
+        except Exception as e:
+            self.logmsg(f"⚠ Verifica encoder fallita: {e}", "warn")
+            return True
+
+    # =================================================================
+    # ===== MONITOR RISORSE ============================================
+    # =================================================================
+    def _read_gpu_usage(self):
+        """Legge utilizzo GPU NVIDIA tramite nvidia-smi, senza aprire CMD su Windows."""
+        try:
+            exe = shutil.which("nvidia-smi")
+            if not exe:
+                return "N/D"
+            out = subprocess.check_output(
+                [exe, "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **_subprocess_hidden_kwargs(),
+            )
+            line = next((x.strip() for x in out.splitlines() if x.strip()), "")
+            if not line:
+                return "N/D"
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) >= 4:
+                name, util, used, total = parts[:4]
+                short_name = name if len(name) <= 22 else name[:20] + "…"
+                return f"{short_name} · {util}% · {used}/{total} MB"
+            return line[:48]
+        except Exception:
+            return "N/D"
+
+    def _update_resource_values(self):
+        try:
+            if PSUTIL_OK:
+                cpu = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory()
+                self.cpu_usage_var.set(f"CPU: {cpu:.0f}%")
+                self.ram_usage_var.set(f"RAM: {mem.percent:.0f}% ({mem.used / 1024**3:.1f}/{mem.total / 1024**3:.1f} GB)")
+            else:
+                self.cpu_usage_var.set("CPU: N/D")
+                self.ram_usage_var.set("RAM: N/D")
+            self.gpu_usage_var.set(f"GPU: {self._read_gpu_usage()}")
+        except Exception:
+            self.cpu_usage_var.set("CPU: N/D")
+            self.gpu_usage_var.set("GPU: N/D")
+            self.ram_usage_var.set("RAM: N/D")
+
+    def _start_resource_monitor(self):
+        """Avvia il monitor live CPU/GPU/RAM mentre la coda sta codificando."""
+        with self._resource_monitor_lock:
+            if self._resource_monitor_thread and self._resource_monitor_thread.is_alive():
+                return
+            self._resource_monitor_stop.clear()
+            if PSUTIL_OK:
+                try:
+                    psutil.cpu_percent(interval=None)
+                except Exception:
+                    pass
+
+            def monitor():
+                while not self._resource_monitor_stop.is_set():
+                    try:
+                        cpu = psutil.cpu_percent(interval=0.5) if PSUTIL_OK else None
+                        if PSUTIL_OK:
+                            mem = psutil.virtual_memory()
+                            cpu_text = f"CPU: {cpu:.0f}%"
+                            ram_text = f"RAM: {mem.percent:.0f}% ({mem.used / 1024**3:.1f}/{mem.total / 1024**3:.1f} GB)"
+                        else:
+                            cpu_text = "CPU: N/D"
+                            ram_text = "RAM: N/D"
+                        gpu_text = f"GPU: {self._read_gpu_usage()}"
+                        self.after(0, lambda c=cpu_text, g=gpu_text, r=ram_text: (
+                            self.cpu_usage_var.set(c),
+                            self.gpu_usage_var.set(g),
+                            self.ram_usage_var.set(r)
+                        ))
+                    except Exception:
+                        pass
+                    self._resource_monitor_stop.wait(0.5)
+
+            self._resource_monitor_thread = threading.Thread(
+                target=monitor, name="NaplexResourceMonitor", daemon=True
+            )
+            self._resource_monitor_thread.start()
+
+    def _stop_resource_monitor(self):
+        with self._resource_monitor_lock:
+            self._resource_monitor_stop.set()
+            thread = self._resource_monitor_thread
+            self._resource_monitor_thread = None
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        self.after(0, lambda: (
+            self.cpu_usage_var.set("CPU: —"),
+            self.gpu_usage_var.set("GPU: —"),
+            self.ram_usage_var.set("RAM: —")
+        ))
+
+    # =================================================================
+    # ===== WORKER =====================================================
+    # =================================================================
+    def worker(self, items, workers):
+        try:
+            self._start_resource_monitor()
+            total = len(items)
+            counter_lock = threading.Lock()
+            done_counter = {"n": 0}
+
+            # Stato iniziale "In coda"
+            for iid in items:
+                src = Path(iid)
+                self.set_state(iid, f"In coda — {src.name}")
+
+            def process_one(iid):
+                if self.cancel_event.is_set():
+                    self.set_state(iid, "Annullato")
+                    return
+                src = Path(iid)
+                try:
+                    with counter_lock:
+                        done_counter["n"] += 1
+                        n = done_counter["n"]
+                    self.set_state(iid,
+                                   f"In lavorazione ({n}/{total}) — {src.name}")
+                    self._set_job(src, status="encoding", started=datetime.now().isoformat(timespec="seconds"), error="")
+                    self._active_job_source = str(src)
+                    self.after(0, lambda s=src.name: self.current_file.set(s))
+                    self.logmsg(f"\n=== {src.name} ===", "head")
+                    # Pre-flight encoder: se l'hardware non è disponibile,
+                    # attiviamo il fallback CPU prima di avviare il rendering.
+                    try:
+                        selected_codec = CODEC_OPTIONS[self.codec_var.get()][0]
+                        if selected_codec != "copy" and not self.check_ffmpeg_codecs(selected_codec):
+                            if self.fallback_nvenc.get() and selected_codec in GPU_FALLBACK:
+                                self.logmsg(f"↪ Encoder {selected_codec} non disponibile: uso fallback CPU.", "warn")
+                            else:
+                                raise RuntimeError(f"Encoder {selected_codec} non disponibile in FFmpeg.")
+                    except KeyError:
+                        pass
+                    count = None
+                    attempts = max(0, int(self.max_retries.get())) if self.retry_enabled.get() else 0
+                    last_exc = None
+                    for retry_no in range(attempts + 1):
+                        try:
+                            count = self.split_file(src)
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            if self.cancel_event.is_set():
+                                raise RuntimeError("Operazione annullata.")
+                            if retry_no >= attempts:
+                                raise
+                            self.logmsg(f"↻ Retry {retry_no + 1}/{attempts} per {src.name}: {exc}", "warn")
+                            time.sleep(1.0)
+                    self.set_state(iid,
+                                   f"Completato ({count} parti) — {src.name}",
+                                   count)
+                    self._set_job(src, status="completed", progress=100.0, parts_total=count, finished=datetime.now().isoformat(timespec="seconds"))
+                    with counter_lock:
+                        self._ok_count += 1
+                except Exception as e:
+                    self.set_state(iid, f"ERRORE — {src.name}")
+                    self._set_job(src, status="failed", error=str(e), finished=datetime.now().isoformat(timespec="seconds"))
+                    self.logmsg(f"✗ ERRORE su {src.name}: {e}", "err")
+                    with counter_lock:
+                        self._err_count += 1
+
+            if workers <= 1:
+                for iid in items:
+                    if self.cancel_event.is_set():
+                        break
+                    process_one(iid)
+            else:
+                work_queue = list(items)
+                qlock = threading.Lock()
+
+                def consume():
+                    while not self.cancel_event.is_set():
+                        with qlock:
+                            if not work_queue:
+                                return
+                            iid = work_queue.pop(0)
+                        process_one(iid)
+
+                threads = [threading.Thread(target=consume, daemon=True)
+                           for _ in range(workers)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+            # ---------- Salvataggio log ----------
+            if self.save_log_csv.get() or self.save_log_json.get():
+                try:
+                    self.save_operation_log()
+                except Exception as e:
+                    self.logmsg(f"⚠ Salvataggio log fallito: {e}", "warn")
+
+            # ---------- Riepilogo ----------
+            cancelled = self.cancel_event.is_set()
+            tag = "warn" if cancelled else ("head" if self._err_count == 0 else "err")
+            self.logmsg("", None)
+            prefix = "ANNULLATO — " if cancelled else ""
+            self.logmsg(
+                f"═══ {prefix}RIEPILOGO: {self._ok_count} OK, "
+                f"{self._err_count} ERRORI ═══",
+                tag
+            )
+            self.after(0, lambda: self.status.set(
+                f"{prefix}Terminato. OK: {self._ok_count} — "
+                f"Errori: {self._err_count}"
+            ))
+            self.after(0, lambda: self.current_progress.set(100))
+            self.after(0, lambda: self.current_file.set("—"))
+            self.after(0, lambda: self.current_speed.set("—"))
+            self.after(0, lambda: self.current_eta.set("—"))
+
+            # ---------- Notifica desktop ----------
+            if self.notify_desktop.get() and PLYER_OK:
+                title = "FFmpeg Split — Annullato" if cancelled else "FFmpeg Split — Completato"
+                msg = f"{self._ok_count} OK, {self._err_count} errori"
+                notify(title, msg)
+
+        finally:
+            self._stop_resource_monitor()
+            self.running = False
+            self.pause_event.set()
+            self.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.after(0, lambda: self.stop_btn.configure(state="disabled"))
+            self.after(0, lambda: self.pause_btn.configure(state="disabled", text="⏸  Pausa"))
+            self._persist_queue_silent()
+
+    # =================================================================
+    # ===== OUTPUT DIR ================================================
+    # =================================================================
+    def output_dir_for(self, src, src_for_tv=None):
+        """
+        Firma compatibile con dry_run (2 argomenti).
+        Se src_for_tv è None, usa src.
+        """
+        base = self.next_output_dir()
+        if base is None:
+            base = Path(self.output.get() or ".")
+
+        target = src_for_tv if src_for_tv is not None else src
+        structure = FOLDER_STRUCTURE_OPTIONS.get(
+            self.folder_structure_var.get(), "flat"
+        )
+
+        # Serie TV
+        if self.smart_tv_paths.get():
+            parsed = parse_tv_filename(target.name)
+            if parsed.get("is_tv"):
+                if structure == "plex":
+                    structure = "plex"
+                elif structure == "jellyfin":
+                    structure = "jellyfin"
+                elif structure == "kodi":
+                    structure = "kodi"
+                else:
+                    structure = "flat"
+                rel, kind = build_series_path(base, parsed, target.stem, structure)
+                return rel, parsed
+
+        # Film
+        if self.detect_movies.get():
+            mv = parse_movie_filename(target.name)
+            if mv.get("is_movie"):
+                rel, _ = build_series_path(base, mv, target.stem, "movie")
+                return rel, mv
+
+        # Fallback: cartella con stem
+        return base / sanitize_path_component(target.stem), None
+
+    # =================================================================
+    # ===== RINOMINA PARTI ============================================
+    # =================================================================
+    def rename_part_filename(self, src, part_idx, total_parts, out_ext,
+                             tv_info=None):
+        """
+        Ritorna il nome file finale per una parte, applicando la modalità
+        scelta nella combobox 'Rinomina parti'.
+        """
+        mode_label = self.rename_part_var.get()
+        mode = RENAME_PART_OPTIONS.get(mode_label, "default")
+        stem = src.stem
+
+        # Placeholder base
+        placeholders = {
+            "stem": stem,
+            "part": part_idx,
+            "total": total_parts,
+            "ext": out_ext,
+            "show": "",
+            "season": "",
+            "episode": "",
+            "title": stem,
+        }
+        if tv_info and tv_info.get("is_tv"):
+            placeholders["show"] = tv_info.get("show", "")
+            placeholders["season"] = f"{tv_info.get('season', 0):02d}"
+            placeholders["episode"] = f"{tv_info.get('episode', 0):02d}"
+
+        if mode == "default":
+            return f"{stem}.part{part_idx:03d}{out_ext}"
+
+        if mode == "part_of_total":
+            return f"{stem} - Part {part_idx:02d} of {total_parts:02d}{out_ext}"
+
+        if mode == "tv_part":
+            if tv_info and tv_info.get("is_tv"):
+                show = sanitize_path_component(tv_info.get("show", stem))
+                s = tv_info.get("season", 0)
+                e = tv_info.get("episode", 0)
+                return (f"{show} - S{s:02d}E{e:02d} - "
+                        f"Part {part_idx:02d}{out_ext}")
+            return f"{stem} - Part {part_idx:02d}{out_ext}"
+
+        if mode == "numeric":
+            return f"{stem}.{part_idx}{out_ext}"
+
+        if mode == "custom":
+            tmpl = self.rename_custom_template.get() or "{stem}.part{part:03d}{ext}"
+            # Supporta sia {part} che {part:03d} (best effort)
+            out = tmpl
+            out = out.replace("{stem}", placeholders["stem"])
+            out = out.replace("{show}", placeholders["show"])
+            out = out.replace("{season}", str(placeholders["season"]))
+            out = out.replace("{episode}", str(placeholders["episode"]))
+            out = out.replace("{title}", placeholders["title"])
+            out = out.replace("{ext}", placeholders["ext"])
+            out = out.replace("{total}", str(placeholders["total"]))
+            out = out.replace("{total:02d}", f"{total_parts:02d}")
+            out = out.replace("{part:03d}", f"{part_idx:03d}")
+            out = out.replace("{part:02d}", f"{part_idx:02d}")
+            out = out.replace("{part}", str(part_idx))
+            # Sanifica eventuali caratteri illegali
+            safe = sanitize_path_component(out)
+            if not safe.endswith(out_ext):
+                safe += out_ext
+            return safe
+
+        return f"{stem}.part{part_idx:03d}{out_ext}"
+
+    # =================================================================
+    # ===== SPLIT FILE — DISPATCHER ===================================
+    # =================================================================
+    def split_file(self, src):
+        info = ffprobe(src)
+        duration = float(info.get("format", {}).get("duration") or 0)
+        if duration <= 0:
+            raise RuntimeError("Durata non disponibile (ffprobe).")
+
+        mode = SPLIT_MODE_OPTIONS[self.split_mode_var.get()]
+
+        if mode == "none":
+            return self.encode_whole_file(src, info, duration)
+        if mode == "size":
+            return self.split_by_size(src, info, duration)
+        if mode == "duration":
+            return self.split_by_duration(src, info, duration)
+        if mode == "parts":
+            return self.split_by_parts(src, info, duration)
+        if mode == "chapters":
+            return self.split_by_chapters(src, info, duration)
+
+        raise RuntimeError(f"Modalità split sconosciuta: {mode}")
+
+    def encode_whole_file(self, src, info, duration):
+        """Modalità senza split: crea un unico file completo."""
+        out_ext = self.effective_output_ext(src)
+        outdir, _ = self.output_dir_for(src)
+        outdir.mkdir(parents=True, exist_ok=True)
+        final = outdir / f"{src.stem}{out_ext}"
+
+        if final.exists() and not self.overwrite.get():
+            if self.skip_existing.get():
+                self.logmsg(f"↻ File intero già esistente: {final.name}", "info")
+                return 1
+            raise RuntimeError(f"Output già esistente: {final}")
+
+        self.wait_if_paused()
+        result = self._render_part(src, info, 0.0, duration, final, 1, 1)
+        self._session_parts += 1
+        self._session_output_bytes += result.get("size", 0)
+        self._session_verified += 1
+        self.handle_input_after(src)
+        return 1
+
+    # =================================================================
+    # ===== SPLIT BY SIZE =============================================
+    # =================================================================
+    def split_by_size(self, src, info, duration):
+        # Determina target bytes
+        auto_label = self.auto_target_var.get()
+        auto_val = AUTO_TARGET_OPTIONS.get(auto_label)
+        if auto_val is not None:
+            target = auto_val
+        else:
+            target = TARGET_OPTIONS[self.target_var.get()]
+
+        # Pre-calcola il numero approssimativo di parti
+        total_size = src.stat().st_size
+        est_parts = max(1, int(total_size / target) + 1)
+
+        # Range: ottimizza iterativamente
+        avg_bps = total_size / duration
+        base = max(1.0, (target * 0.985) / avg_bps)
+
+        start = 0.0
+        part = 1
+        created = 0
+
+        while start < duration - 0.02 and not self.cancel_event.is_set():
+            self.wait_if_paused()
+            remaining = duration - start
+            guess = min(remaining, base)
+            final = self._final_name(src, part, est_parts, info)
+
+            if self._resume_part_done(src, part) and final.exists():
+                self.logmsg(f"↻ Resume: parte {part:03d} già completata.", "info")
+                try: self._mark_part_done(src, part, est_parts, final.stat().st_size)
+                except Exception: pass
+                start += float(ffprobe(final).get("format", {}).get("duration") or guess) if final.exists() else guess
+                part += 1
+                continue
+
+            if (final.exists() and self.skip_existing.get()
+                    and not self.overwrite.get()):
+                try:
+                    existing = ffprobe(final)
+                    actual = float(existing.get("format", {}).get("duration") or guess)
+                except Exception:
+                    actual = guess
+                self.logmsg(f"Salto esistente: {final.name}", "info")
+                try: self._mark_part_done(src, part, est_parts, final.stat().st_size)
+                except Exception: pass
+                start += actual
+                part += 1
+                continue
+
+            final_bytes = self._render_part(src, info, start, guess,
+                                            final, part, est_parts)
+            created += 1
+            start += max(0.001, final_bytes["actual_duration"])
+            part += 1
+            pct = min(100.0, start / duration * 100.0)
+            self.after(0, lambda v=pct: self.current_progress.set(v))
+
+        return created
+
+    # =================================================================
+    # ===== SPLIT BY DURATION =========================================
+    # =================================================================
+    def split_by_duration(self, src, info, duration):
+        sel = self.duration_var.get()
+        chunk = DURATION_OPTIONS.get(sel)
+        if chunk is None:
+            chunk = float(self.custom_duration_sec_var.get())
+        if chunk <= 0:
+            raise RuntimeError("Durata fissa non valida.")
+
+        n_parts_est = max(1, int(duration // chunk) + 1)
+        start = 0.0
+        part = 1
+        created = 0
+
+        while start < duration - 0.02 and not self.cancel_event.is_set():
+            self.wait_if_paused()
+            remaining = duration - start
+            this_chunk = min(chunk, remaining)
+            final = self._final_name(src, part, n_parts_est, info)
+
+            if self._resume_part_done(src, part) and final.exists():
+                self.logmsg(f"↻ Resume: parte {part:03d} già completata.", "info")
+                try: self._mark_part_done(src, part, n_parts_est, final.stat().st_size)
+                except Exception: pass
+                start += float(ffprobe(final).get("format", {}).get("duration") or this_chunk) if final.exists() else this_chunk
+                part += 1
+                continue
+
+            if (final.exists() and self.skip_existing.get()
+                    and not self.overwrite.get()):
+                self.logmsg(f"Salto esistente: {final.name}", "info")
+                try: self._mark_part_done(src, part, n_parts_est, final.stat().st_size)
+                except Exception: pass
+                start += this_chunk
+                part += 1
+                continue
+
+            self._render_part(src, info, start, this_chunk, final,
+                              part, n_parts_est)
+            created += 1
+            start += max(0.001, this_chunk)
+            part += 1
+            pct = min(100.0, start / duration * 100.0)
+            self.after(0, lambda v=pct: self.current_progress.set(v))
+
+        return created
+
+    # =================================================================
+    # ===== SPLIT BY PARTS ============================================
+    # =================================================================
+    def split_by_parts(self, src, info, duration):
+        try:
+            n = int(self.parts_n_var.get())
+        except ValueError:
+            n = 2
+        n = max(2, min(50, n))
+        chunk = duration / n
+
+        start = 0.0
+        created = 0
+
+        for part in range(1, n + 1):
+            self.wait_if_paused()
+            if self.cancel_event.is_set():
+                break
+            remaining = duration - start
+            this_chunk = min(chunk, remaining)
+            if this_chunk < 0.05:
+                break
+
+            final = self._final_name(src, part, n, info)
+            if self._resume_part_done(src, part) and final.exists():
+                self.logmsg(f"↻ Resume: parte {part:03d} già completata.", "info")
+                start += float(ffprobe(final).get("format", {}).get("duration") or this_chunk)
+                continue
+            if (final.exists() and self.skip_existing.get()
+                    and not self.overwrite.get()):
+                self.logmsg(f"Salto esistente: {final.name}", "info")
+                try: self._mark_part_done(src, part, n, final.stat().st_size)
+                except Exception: pass
+                start += this_chunk
+                continue
+
+            self._render_part(src, info, start, this_chunk, final, part, n)
+            created += 1
+            start += max(0.001, this_chunk)
+            pct = min(100.0, start / duration * 100.0)
+            self.after(0, lambda v=pct: self.current_progress.set(v))
+
+        return created
+
+    # =================================================================
+    # ===== SPLIT BY CHAPTERS =========================================
+    # =================================================================
+    def split_by_chapters(self, src, info, duration):
+        chapters = get_chapters(info)
+        if not chapters:
+            raise RuntimeError("Nessun capitolo trovato nel file.")
+
+        n = len(chapters)
+        self.logmsg(f"📑 Trovati {n} capitoli", "info")
+        created = 0
+
+        for i, (st, en, title) in enumerate(chapters, 1):
+            self.wait_if_paused()
+            if self.cancel_event.is_set():
+                break
+            chunk = en - st
+            if chunk < 0.1:
+                continue
+            final = self._final_name(src, i, n, info)
+            if self._resume_part_done(src, i) and final.exists():
+                self.logmsg(f"↻ Resume: parte {i:03d} già completata.", "info")
+                continue
+            if (final.exists() and self.skip_existing.get()
+                    and not self.overwrite.get()):
+                self.logmsg(f"Salto esistente: {final.name}", "info")
+                try: self._mark_part_done(src, i, n, final.stat().st_size)
+                except Exception: pass
+                continue
+            self.logmsg(f"  Capitolo {i:02d}: {title or '(senza titolo)'} "
+                        f"({chunk:.1f}s)", "info")
+            self._render_part(src, info, st, chunk, final, i, n)
+            created += 1
+            pct = min(100.0, (i / n) * 100.0)
+            self.after(0, lambda v=pct: self.current_progress.set(v))
+
+        return created
+
+    # =================================================================
+    # ===== HELPER: nome file finale ==================================
+    # =================================================================
+    def _final_name(self, src, part_idx, total_parts, info):
+        out_ext = self.effective_output_ext(src)
+        outdir, tv_info = self.output_dir_for(src)
+        outdir.mkdir(parents=True, exist_ok=True)
+        fname = self.rename_part_filename(src, part_idx, total_parts,
+                                          out_ext, tv_info)
+        return outdir / fname
+
+    # =================================================================
+    # ===== RENDER PART (core encoding di UNA parte) =================
+    # =================================================================
+    def _render_part(self, src, info, start, dur, final, part, total):
+        """
+        Esegue ffmpeg per creare una singola parte.
+        Ritorna dict con info (actual_duration, size, rc, elapsed).
+        """
+        out_ext = self.effective_output_ext(src)
+        outdir = final.parent
+
+        codec, is_gpu, is_copy = CODEC_OPTIONS[self.codec_var.get()]
+        audio_codec, _ = AUDIO_OPTIONS[self.audio_var.get()]
+        res_h = RESOLUTION_OPTIONS[self.resolution_var.get()]
+        fps_val = FPS_OPTIONS[self.fps_var.get()]
+        sub_mode = SUBTITLE_OPTIONS[self.subtitle_var.get()]
+        subs_present = has_subtitles(info)
+        v_br = self.get_video_bitrate()
+        a_br = self.get_audio_bitrate()
+        title = title_from_info(info) or (
+            src.stem if self.use_filename_as_title.get() else ""
+        )
+        extra_args, err = self.get_extra_args_from_text()
+        if err:
+            raise RuntimeError(f"Argomenti extra non validi: {err}")
+
+        # Prova con codec scelto, con fallback NVENC→CPU se attivo
+        attempted_codecs = [codec]
+        if not is_copy:
+            # Recupero automatico: se l'encoder hardware non funziona
+            # (driver, GPU, pixel format o build FFmpeg), prova prima HEVC CPU
+            # e infine H.264 CPU, evitando di bloccare l'intera coda.
+            if self.fallback_nvenc.get() and codec in GPU_FALLBACK:
+                # Hardware -> CPU robusto: prova entrambi i codec CPU.
+                # Questo evita che un singolo encoder mancante/bloccato faccia
+                # fallire l'intera operazione.
+                for fb in (GPU_FALLBACK[codec], "libx264", "libx265"):
+                    if fb not in attempted_codecs:
+                        attempted_codecs.append(fb)
+
+        last_error = None
+        # Alcuni container (soprattutto MP4/MOV) non accettano determinati
+        # codec audio in stream-copy. Se succede, ritentiamo automaticamente
+        # con AAC senza chiedere all'utente di cambiare impostazioni.
+        # MP4/MOV: se l'utente ha scelto stream-copy audio, manteniamo copy
+        # e lasciamo che il retry del codec gestisca eventuali incompatibilità.
+        audio_codec_eff = audio_codec
+        for attempt_codec in attempted_codecs:
+            if self.cancel_event.is_set():
+                raise RuntimeError("Operazione annullata.")
+
+            is_gpu_eff = attempt_codec.endswith(("_nvenc", "_qsv", "_amf"))
+            is_copy_eff = (attempt_codec == "copy")
+
+            # Prova iterativa per centrare il target (solo in modalità size)
+            use_target_size = (SPLIT_MODE_OPTIONS[self.split_mode_var.get()]
+                               == "size")
+            auto_label = self.auto_target_var.get()
+            auto_val = AUTO_TARGET_OPTIONS.get(auto_label)
+            target_bytes = (auto_val if auto_val is not None
+                            else TARGET_OPTIONS[self.target_var.get()])
+
+            guess = dur
+            best_tmp = None
+            best_info = None
+
+            attempts = 9 if use_target_size else 1
+            audio_fallback_tried = False
+            for attempt_idx in range(attempts):
+                if self.cancel_event.is_set():
+                    raise RuntimeError("Operazione annullata.")
+
+                tmp = outdir / f".naplex19_tmp_{part:03d}_{attempt_idx}{out_ext}"
+                tmp.unlink(missing_ok=True)
+
+                cmd = self.build_ffmpeg_cmd(
+                    src, tmp, start, guess, title,
+                    attempt_codec, is_gpu_eff, is_copy_eff,
+                    audio_codec_eff, a_br,
+                    res_h, fps_val,
+                    sub_mode, subs_present,
+                    v_br, info, extra_args
+                )
+
+                # Priorità processo + progress reale
+                rc, err_text, elapsed = self._exec_with_progress(
+                    cmd, guess, part, total
+                )
+
+                if rc != 0 or not tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                    last_error = err_text
+                    # AI Auto-Fix: classifica l'errore e prepara una strategia di retry.
+                    try:
+                        if self.ai_enabled.get():
+                            plan = self._ai_plan_fix(err_text, attempt_codec, audio_codec_eff, sub_mode)
+                            self.ai_last_error = {
+                                "time": datetime.now().isoformat(timespec="seconds"),
+                                "source": str(src), "part": part, "cmd": [str(x) for x in cmd],
+                                "rc": rc, "stderr": err_text, "plan": plan
+                            }
+                            self.ai_status_var.set(f"AI: {plan['diagnosis']['explanation']}")
+                            if plan.get("audio") == "aac" and audio_codec_eff == "copy":
+                                audio_codec_eff = "aac"
+                                self.logmsg("🧠 AI Auto-Fix: audio → AAC", "warn")
+                                continue
+                    except Exception:
+                        pass
+                    # Fallback audio automatico per MP4/MOV: DTS/PCM/codec
+                    # non supportati in copy possono bloccare FFmpeg.
+                    if (audio_codec == "copy" and
+                            out_ext.lower() in (".mp4", ".m4v", ".mov") and
+                            audio_codec_eff == "copy" and not audio_fallback_tried):
+                        audio_fallback_tried = True
+                        audio_codec_eff = "aac"
+                        self.logmsg("↪ Audio copy incompatibile con il container: retry con AAC.", "warn")
+                        continue
+                    audio_codec_eff = audio_codec
+                    if attempt_codec != codec:
+                        self.logmsg(
+                            f"⚠ Fallback {codec} → {attempt_codec} riuscito parzialmente",
+                            "warn"
+                        )
+                    break  # prova codec successivo
+
+                sz = tmp.stat().st_size
+                best_tmp = tmp
+                try:
+                    p_info = ffprobe(tmp)
+                    actual = float(p_info.get("format", {}).get("duration") or guess)
+                except Exception:
+                    actual = guess
+                best_info = {"actual_duration": actual, "size": sz, "rc": rc,
+                             "elapsed": elapsed, "codec": attempt_codec}
+
+                if not use_target_size:
+                    break  # durata fissa, niente iterazioni
+
+                if sz <= target_bytes:
+                    ratio = target_bytes / max(sz, 1)
+                    if 0.94 <= ratio <= 1.08 or guess >= dur - 0.01:
+                        break
+                    guess = min(dur, guess * min(1.10, max(1.01, ratio)))
+                else:
+                    guess = max(0.25, guess * (target_bytes / sz) * 0.96)
+
+                tmp.unlink(missing_ok=True)
+
+            if best_tmp is not None and best_info is not None:
+                # Rinomina tmp → final
+                if final.exists() and self.overwrite.get():
+                    final.unlink()
+                try:
+                    best_tmp.rename(final)
+                except Exception:
+                    # Cross-device: usa shutil.move
+                    shutil.move(str(best_tmp), str(final))
+
+                # Verifica atomica dell'output prima di considerare la parte completata.
+                try:
+                    verification = self.verify_output_file(src, final, best_info["actual_duration"])
+                    if verification.get("sha256"):
+                        best_info["sha256"] = verification["sha256"]
+                    self._mark_part_done(src, part, total, best_info["size"])
+                except Exception:
+                    final.unlink(missing_ok=True)
+                    raise
+
+                # Log
+                self.logmsg(
+                    f"✓ Parte {part:03d}/{total:02d}: {final.name} — "
+                    f"{size_text(best_info['size'])} — "
+                    f"[codec: {best_info['codec']}] [elapsed: {best_info['elapsed']:.1f}s]",
+                    "ok"
+                )
+
+                # CSV row
+                self._append_log_row(src, final, part, total,
+                                     best_info["actual_duration"],
+                                     best_info["size"], codec, audio_codec,
+                                     res_h, fps_val, "ok")
+
+                # Gestione input (una sola volta a fine file, in split_file)
+                return best_info
+
+        # Nessun codec ha funzionato
+        if last_error:
+            self.report_ffmpeg_error(src, part, cmd, -1, last_error)
+        # Messaggio finale più utile: indica se è fallito l'hardware e quali
+        # encoder sono stati realmente provati.
+        tried = ", ".join(attempted_codecs)
+        raise RuntimeError(
+            f"Impossibile creare la parte {part:03d}. "
+            f"Encoder provati: {tried}. "
+            "Controlla FFmpeg, driver NVIDIA, spazio disco e formato di output."
+        )
+
+    # =================================================================
+    # ===== EXEC CON PROGRESS REALE ===================================
+    # =================================================================
+    def _exec_with_progress(self, cmd, duration, part, total):
+        """
+        Esegue ffmpeg con -progress pipe:1.
+        Aggiorna current_speed, current_eta, current_progress.
+        Ritorna (rc, stderr, elapsed).
+        """
+        def progress_cb(pct, done_sec, speed, fps):
+            try:
+                self.after(0, lambda p=pct: self.current_progress.set(p))
+                if speed:
+                    self.after(0, lambda s=speed: self.current_speed.set(s))
+                    # Parse speed (es. "1.85x" o "0.987x")
+                    try:
+                        x = float(speed.rstrip("x"))
+                        if x > 0 and duration > 0:
+                            rem = (duration - done_sec) / x
+                            self.after(0, lambda r=rem: self.current_eta.set(
+                                self._fmt_eta(r)
+                            ))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        rc, stderr, elapsed = run_ffmpeg_with_progress(
+            cmd, duration, progress_cb=progress_cb,
+            cancel_event=self.cancel_event,
+            process_register=self._register_ffmpeg_process,
+            process_unregister=self._unregister_ffmpeg_process,
+        )
+        return rc, stderr, elapsed
+
+    @staticmethod
+    def _fmt_eta(sec):
+        sec = int(max(0, sec))
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m {s:02d}s"
+        if m:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    # =================================================================
+    # ===== REPORT ERRORI FFMPEG =====================================
+    # =================================================================
+    def report_ffmpeg_error(self, src, part, cmd, rc, stderr):
+        # Salva l'errore nel motore AI prima della diagnosi standard.
+        try:
+            self.ai_capture_error(src, part, cmd, rc, stderr)
+        except Exception:
+            pass
+        self.logmsg("", None)
+        self.logmsg("╔══════════════════════════════════════════════════════", "err")
+        self.logmsg(f"║ ✗ ERRORE FFMPEG — {src.name} (parte {part:03d})", "err")
+        self.logmsg(f"║ Codice di uscita: {rc}", "err")
+        self.logmsg("╚══════════════════════════════════════════════════════", "err")
+
+        cmd_str = " ".join(str(c) for c in cmd)
+        if len(cmd_str) > 400:
+            cmd_str = cmd_str[:400] + " …"
+        self.logmsg(f"  CMD: {cmd_str}", "warn")
+
+        lines = last_stderr_lines(stderr, n=25)
+        if lines:
+            self.logmsg("  ── Stderr FFmpeg (ultime righe) ──", "warn")
+            for ln in lines:
+                self.logmsg(f"    {ln}", "err")
+
+        diags = diagnose_ffmpeg_error(stderr)
+        if diags:
+            self.logmsg("  ── Diagnosi automatica ──", "warn")
+            for cat, expl, hint in diags:
+                self.logmsg(f"    • [{cat}] {expl}", "err")
+                self.logmsg(f"      → {hint}", "info")
+
+    # =================================================================
+    # ===== BUILD FFMPEG CMD ==========================================
+    # =================================================================
+    def build_ffmpeg_cmd(self, src, tmp, start, dur, title,
+                         codec, is_gpu, is_copy,
+                         audio_codec, audio_br,
+                         res_h, fps_val,
+                         sub_mode, subs_present,
+                         video_br, info, extra_args):
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        ]
+
+        # Threads
+        threads = self.threads_var.get()
+        if threads and threads != "Auto":
+            try:
+                cmd += ["-threads", str(int(threads))]
+            except ValueError:
+                pass
+
+        cmd += [
+            "-ss", seconds(start),
+            "-i", str(src),
+        ]
+        logo_enabled = bool(self.static_logo_enabled.get() and self.static_logo_path.get())
+        if logo_enabled:
+            cmd += ["-loop", "1", "-i", str(self.static_logo_path.get())]
+        cmd += ["-t", seconds(dur)]
+
+
+        # Mappa stream: se l'utente ha selezionato stream nel MAP Manager,
+        # usa esclusivamente quelli. Altrimenti mantiene il mapping automatico.
+        manual_maps = self._map_selected_items() if getattr(self, "map_streams", None) else []
+        logo_filter = self._logo_overlay_filter() if logo_enabled else None
+        if manual_maps:
+            if logo_filter:
+                cmd += ["-filter_complex", logo_filter, "-map", "[vout]"]
+                manual_nonvideo = []
+                for stream_idx in manual_maps:
+                    if self.map_tree and self.map_tree.exists(str(stream_idx)):
+                        vals = self.map_tree.item(str(stream_idx), "values")
+                        if len(vals) > 2 and str(vals[2]).lower() != "video":
+                            manual_nonvideo.append(stream_idx)
+                for stream_idx in manual_nonvideo:
+                    cmd += ["-map", f"0:{stream_idx}"]
+            else:
+                for stream_idx in manual_maps:
+                    cmd += ["-map", f"0:{stream_idx}"]
+        else:
+            # Mappa video
+            if logo_filter:
+                cmd += ["-filter_complex", logo_filter, "-map", "[vout]"]
+            else:
+                cmd += ["-map", "0:v:0"]
+
+            # Mappa audio
+            if audio_codec is not None:
+                cmd += ["-map", "0:a:0?"]
+
+        # ---------- Sottotitoli ----------
+        burn_in = (sub_mode == "burn" and subs_present)
+        copy_subs = False
+        sub_streams = subtitle_streams(info)
+
+        if not manual_maps and sub_mode == "copy":
+            for s in sub_streams:
+                cmd += ["-map", f"0:{s['index']}"]
+            copy_subs = bool(sub_streams)
+        elif not manual_maps and sub_mode == "forced_only":
+            for s in sub_streams:
+                if is_forced(s):
+                    cmd += ["-map", f"0:{s['index']}"]
+                    copy_subs = True
+        elif not manual_maps and sub_mode == "exclude_forced":
+            for s in sub_streams:
+                if not is_forced(s):
+                    cmd += ["-map", f"0:{s['index']}"]
+                    copy_subs = True
+
+        # ---------- Filtri video ----------
+        vf_chain = []
+        if res_h is not None:
+            vf_chain.append(f"scale=-2:{res_h}")
+        if fps_val is not None:
+            vf_chain.append(f"fps={fps_val}")
+        if self.denoise.get():
+            vf_chain.append("hqdn3d=1.5:1.5:6:6")
+        if self.deinterlace.get():
+            vf_chain.append("yadif=0:-1:0")
+        if self.hdr_tonemap.get() and is_hdr(info):
+            vf_chain.append(
+                "zscale=t=linear:npl=100,format=gbrpf32le,"
+                "zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+            )
+        if burn_in:
+            src_escaped = escape_for_subtitles_filter(src)
+            vf_chain.append(f"subtitles='{src_escaped}'")
+
+        vf = ",".join(vf_chain) if vf_chain else None
+        if logo_filter and vf:
+            logo_filter = f"[0:v]{vf}[base];" + logo_filter.replace("[0:v]", "[base]", 1)
+            # sostituisci il filter_complex già inserito con quello completo
+            idx = cmd.index("-filter_complex")
+            cmd[idx + 1] = logo_filter
+        elif vf and not logo_filter:
+            cmd += ["-vf", vf]
+
+        # ---------- Codec video ----------
+        # Overlay logo / burn-in richiedono sempre una ricodifica.
+        if is_copy and (vf is not None or logo_filter):
+            codec = "libx264"
+            is_copy = False
+            is_gpu = False
+        if is_copy and vf is None and not logo_filter:
+            cmd += ["-c:v", "copy", "-avoid_negative_ts", "make_zero"]
+        else:
+            cmd += ["-c:v", codec]
+            if is_gpu and codec.endswith("_nvenc"):
+                cmd += ["-preset", self.nvenc_preset_var.get(), "-rc", "vbr"]
+                if video_br > 0:
+                    maxrate = int(video_br * 1.5)
+                    bufsize = int(video_br * 2)
+                    cmd += ["-b:v", f"{video_br}k",
+                            "-maxrate", f"{maxrate}k",
+                            "-bufsize", f"{bufsize}k"]
+                else:
+                    crf = int(self.crf_var.get()) or 23
+                    cq = max(19, min(35, crf))
+                    cmd += ["-cq", str(cq), "-b:v", "0"]
+                # Compatibilità NVENC: molti driver/build rifiutano pixel
+                # format 10-bit o formati YUV non supportati. Per l'output
+                # standard usiamo yuv420p, salvo che un filtro abbia già
+                # imposto un formato esplicito.
+                if "-pix_fmt" not in cmd:
+                    cmd += ["-pix_fmt", "yuv420p"]
+            elif is_gpu:
+                # QSV / AMF
+                cmd += ["-b:v", f"{video_br}k" if video_br > 0 else "5000k"]
+            else:
+                preset = self.encoder_preset_var.get() or "veryfast"
+                cmd += ["-preset", preset]
+                tune = self.tune_var.get()
+                if tune and tune != "(nessuno)":
+                    cmd += ["-tune", tune]
+                if video_br > 0:
+                    maxrate = int(video_br * 1.5)
+                    bufsize = int(video_br * 2)
+                    cmd += ["-b:v", f"{video_br}k",
+                            "-maxrate", f"{maxrate}k",
+                            "-bufsize", f"{bufsize}k"]
+                else:
+                    crf = int(self.crf_var.get()) or 21
+                    cmd += ["-crf", str(crf)]
+                # Output video standard compatibile con la maggior parte dei
+                # container/player, evitando problemi con sorgenti 10-bit/444.
+                if "-pix_fmt" not in cmd:
+                    cmd += ["-pix_fmt", "yuv420p"]
+
+        # ---------- Codec audio ----------
+        if audio_codec is None:
+            cmd += ["-an"]
+        elif audio_codec == "copy":
+            cmd += ["-c:a", "copy"]
+        elif audio_codec == "flac":
+            cmd += ["-c:a", "flac"]
+        else:
+            cmd += ["-c:a", audio_codec]
+            if audio_br > 0:
+                cmd += ["-b:a", f"{audio_br}k"]
+
+        # Loudnorm
+        if self.loudnorm.get() and audio_codec not in (None, "copy"):
+            cmd += ["-af", "loudnorm=I=-16:LRA=11:TP=-1.5"]
+
+        # ---------- Sottotitoli output ----------
+        if burn_in or sub_mode == "none":
+            cmd += ["-sn"]
+        elif copy_subs:
+            cmd += ["-c:s", "copy"]
+
+        # ---------- Checkbox FFmpeg ----------
+        if self.opt_pix_fmt_yuv420p.get():
+            cmd += ["-pix_fmt", "yuv420p"]
+        if self.opt_movflags_faststart.get():
+            cmd += ["-movflags", "+faststart"]
+
+        # ---------- Extra args utente ----------
+        if extra_args:
+            cmd += list(extra_args)
+
+        # ---------- Metadati ----------
+        if self.copy_metadata.get():
+            cmd += ["-map_metadata", "0"]
+        if title:
+            cmd += ["-metadata", f"title={title}"]
+            cmd += ["-metadata:s:v:0", f"title={title}"]
+
+        # Metadata statici: se valorizzati, sovrascrivono quelli originali.
+        static_meta = {
+            "title": self.static_title_var.get().strip(),
+            "artist": self.static_artist_var.get().strip(),
+            "album": self.static_album_var.get().strip(),
+            "genre": self.static_genre_var.get().strip(),
+            "comment": self.static_comment_var.get().strip(),
+            "date": self.static_year_var.get().strip(),
+        }
+        for key, value in static_meta.items():
+            if value:
+                cmd += ["-metadata", f"{key}={value}"]
+
+        cmd += [str(tmp)]
+        return cmd
+
+    # =================================================================
+    # ===== GESTIONE INPUT DOPO ENCODING =============================
+    # =================================================================
+    def handle_input_after(self, src):
+        """Applica la modalità scelta per il file di input."""
+        if not self.delete_input_after.get():
+            return
+        mode = self.delete_mode_var.get()
+        try:
+            if mode == "Cestino di sistema (send2trash)":
+                if not SEND2TRASH_OK:
+                    self.logmsg(
+                        "⚠ send2trash non disponibile, uso _TRASH folder.",
+                        "warn"
+                    )
+                    ok, info = send_to_trash(src)
+                else:
+                    send2trash(str(src))
+                    ok, info = True, "cestino di sistema"
+            elif mode == "Sposta in _TRASH (recuperabile)":
+                ok, info = send_to_trash(src)
+            elif mode == "Sposta in cartella custom":
+                dest_dir = Path(self.custom_trash_dir.get() or "")
+                if not dest_dir.is_dir():
+                    self.logmsg(
+                        f"⚠ Cartella custom non valida: {dest_dir}", "warn"
+                    )
+                    return
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                target = dest_dir / src.name
+                if target.exists():
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    target = dest_dir / f"{src.stem}_{ts}{src.suffix}"
+                shutil.move(str(src), str(target))
+                ok, info = True, f"spostato in {dest_dir}"
+            elif mode == "Elimina definitivamente":
+                src.unlink()
+                ok, info = True, "eliminato"
+            else:
+                return
+
+            if ok:
+                self.logmsg(f"🗑 File di input gestito: {src} → {info}", "warn")
+            else:
+                self.logmsg(f"⚠ Gestione input fallita: {info}", "err")
+        except Exception as e:
+            self.logmsg(f"⚠ Errore gestione input {src}: {e}", "err")
+
+    # =================================================================
+    # ===== LOG CSV / JSON ============================================
+    # =================================================================
+    def _append_log_row(self, src, final, part, total,
+                        duration, size, codec, audio_codec,
+                        res_h, fps_val, status):
+        row = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "input_file": str(src),
+            "output_file": str(final),
+            "part_num": part,
+            "total_parts": total,
+            "duration_sec": round(duration, 3),
+            "size_bytes": size,
+            "codec_video": codec,
+            "codec_audio": audio_codec or "copy",
+            "resolution": res_h or "orig",
+            "fps": fps_val or "orig",
+            "split_mode": self.split_mode_var.get(),
+            "status": status,
+            "verified": bool(self.verify_output.get()),
+            "sha256": "",
+            "elapsed_sec": "",
+            "speed": "",
+            "error": "" if status == "ok" else status,
+        }
+        with self.log_lock:
+            self.log_rows.append(row)
+
+    def save_operation_log(self):
+        if not self.output_dirs:
+            return
+        base = Path(self.output_dirs[0])
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved = []
+
+        if self.save_log_csv.get():
+            csv_path = base / f"split_log_{ts}.csv"
+            try:
+                import csv
+                with open(csv_path, "w", newline="",
+                          encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=LOG_CSV_HEADER)
+                    writer.writeheader()
+                    for row in self.log_rows:
+                        writer.writerow({k: row.get(k, "") for k in LOG_CSV_HEADER})
+                saved.append(str(csv_path))
+            except Exception as e:
+                self.logmsg(f"⚠ CSV log fallito: {e}", "warn")
+
+        if self.save_log_json.get():
+            json_path = base / f"split_log_{ts}.json"
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(self.log_rows, f, indent=2, ensure_ascii=False)
+                saved.append(str(json_path))
+            except Exception as e:
+                self.logmsg(f"⚠ JSON log fallito: {e}", "warn")
+
+        for p in saved:
+            self.logmsg(f"📄 Log salvato: {p}", "ok")
+
+    # =================================================================
+    # ===== PERSISTENZA: TO_DICT / FROM_DICT ==========================
+    # =================================================================
+    def to_dict(self):
+        try:
+            extra_txt = self.extra_args_text.get("1.0", "end").strip()
+        except Exception:
+            extra_txt = self.extra_args_var.get()
+        return {
+            "_version": SETTINGS_VERSION,
+            "_app": "FFmpeg Split GUI — naplex19",
+
+            # Sorgente & output
+            "folder": self.folder.get(),
+            "output_dirs": list(self.output_dirs),
+            "recursive": bool(self.recursive.get()),
+            "only_over_4gib": bool(self.only_over_4gib.get()),
+            "smart_tv_paths": bool(self.smart_tv_paths.get()),
+            "detect_movies": bool(self.detect_movies.get()),
+            "folder_structure": self.folder_structure_var.get(),
+            "theme": self.theme_var.get(),
+            "ffmpeg_path": self.ffmpeg_path_var.get(),
+            "ffmpeg_autodetect": bool(self.ffmpeg_autodetect.get()),
+
+            # Split mode
+            "split_mode": self.split_mode_var.get(),
+            "target": self.target_var.get(),
+            "auto_target": self.auto_target_var.get(),
+            "duration": self.duration_var.get(),
+            "custom_duration_sec": int(self.custom_duration_sec_var.get()),
+            "parts_n": self.parts_n_var.get(),
+
+            # Video
+            "codec": self.codec_var.get(),
+            "encoder_preset": self.encoder_preset_var.get(),
+            "nvenc_preset": self.nvenc_preset_var.get(),
+            "tune": self.tune_var.get(),
+            "resolution": self.resolution_var.get(),
+            "fps": self.fps_var.get(),
+            "video_bitrate_kbps": self.get_video_bitrate(),
+            "crf": int(self.crf_var.get()),
+            "denoise": bool(self.denoise.get()),
+            "deinterlace": bool(self.deinterlace.get()),
+            "hdr_tonemap": bool(self.hdr_tonemap.get()),
+
+            # Audio
+            "audio_codec": self.audio_var.get(),
+            "audio_bitrate_kbps": self.get_audio_bitrate(),
+            "loudnorm": bool(self.loudnorm.get()),
+
+            # Sub
+            "subtitle_mode": self.subtitle_var.get(),
+            "infer_no_sub": bool(self.infer_no_sub.get()),
+            "output_ext": self.output_ext_var.get(),
+
+            # File
+            "overwrite": bool(self.overwrite.get()),
+            "skip_existing": bool(self.skip_existing.get()),
+            "use_filename_as_title": bool(self.use_filename_as_title.get()),
+            "copy_metadata": bool(self.copy_metadata.get()),
+            "static_title": self.static_title_var.get(),
+            "static_artist": self.static_artist_var.get(),
+            "static_album": self.static_album_var.get(),
+            "static_genre": self.static_genre_var.get(),
+            "static_comment": self.static_comment_var.get(),
+            "static_year": self.static_year_var.get(),
+            "static_logo_enabled": bool(self.static_logo_enabled.get()),
+            "static_logo_path": self.static_logo_path.get(),
+            "static_logo_position": self.static_logo_position.get(),
+            "static_logo_size": int(self.static_logo_size.get()),
+            "static_logo_opacity": int(self.static_logo_opacity.get()),
+            "opt_pix_fmt_yuv420p": bool(self.opt_pix_fmt_yuv420p.get()),
+            "opt_movflags_faststart": bool(self.opt_movflags_faststart.get()),
+
+            # Delete / trash
+            "delete_input_after": bool(self.delete_input_after.get()),
+            "delete_mode": self.delete_mode_var.get(),
+            "custom_trash_dir": self.custom_trash_dir.get(),
+
+            # Performance
+            "auto_workers": bool(self.auto_workers.get()),
+            "parallel_workers": int(self.parallel_workers.get()),
+            "threads": self.threads_var.get(),
+            "priority": self.priority_var.get(),
+            "fallback_nvenc": bool(self.fallback_nvenc.get()),
+            "check_disk_space": bool(self.check_disk_space.get()),
+
+            # Rinomina
+            "rename_part": self.rename_part_var.get(),
+            "rename_custom_template": self.rename_custom_template.get(),
+
+            # Extra
+            "extra_ffmpeg_args": extra_txt,
+
+            # Log & notif
+            "save_log_csv": bool(self.save_log_csv.get()),
+            "save_log_json": bool(self.save_log_json.get()),
+            "notify_desktop": bool(self.notify_desktop.get()),
+
+            # Persistenza
+            "autoload_settings": bool(self.autoload_settings.get()),
+            "autosave_settings": bool(self.autosave_settings.get()),
+            "settings_auto_backup": bool(self.settings_auto_backup.get()),
+            "settings_validate_on_apply": bool(self.settings_validate_on_apply.get()),
+
+            # v1.1 queue / resume / verification / smart
+            "resume_enabled": bool(self.resume_enabled.get()),
+            "verify_output": bool(self.verify_output.get()),
+            "verify_duration_tolerance": float(self.verify_duration_tolerance.get()),
+            "retry_enabled": bool(self.retry_enabled.get()),
+            "max_retries": int(self.max_retries.get()),
+            "smart_encode": bool(self.smart_encode.get()),
+            "smart_profile": self.smart_profile_var.get(),
+            "preferred_languages": self.preferred_languages_var.get(),
+            "generate_hash": bool(self.generate_hash.get()),
+            "protect_input": bool(self.protect_input.get()),
+            "auto_start_queue": bool(self.auto_start_queue.get()),
+        }
+
+    def from_dict(self, data):
+        # Retrocompatibilità v1.14 → v1.1
+        def get(key, default=None):
+            return data.get(key, default)
+
+        # Sorgente
+        if get("folder"):
+            self.folder.set(get("folder"))
+        if isinstance(get("output_dirs"), list):
+            self.output_dirs = [str(p) for p in get("output_dirs")]
+            self.output_listbox.delete(0, "end")
+            for d in self.output_dirs:
+                self.output_listbox.insert("end", d)
+            self.output.set(self.output_dirs[0] if self.output_dirs else "")
+
+        self.recursive.set(bool(get("recursive", True)))
+        self.only_over_4gib.set(bool(get("only_over_4gib", False)))
+        self.smart_tv_paths.set(bool(get("smart_tv_paths", True)))
+        self.detect_movies.set(bool(get("detect_movies", True)))
+        if get("folder_structure") in FOLDER_STRUCTURE_OPTIONS:
+            self.folder_structure_var.set(get("folder_structure"))
+        saved_theme = get("theme")
+        if saved_theme in GUI_THEMES:
+            self.theme_var.set(saved_theme)
+        elif saved_theme in ("Scuro", "Blu", "Naplex Prime"):
+            self.theme_var.set("Bianco")
+        self.apply_theme()
+
+        self.ffmpeg_path_var.set(str(get("ffmpeg_path", "")))
+        self.ffmpeg_autodetect.set(bool(get("ffmpeg_autodetect", True)))
+        global FFMPEG_CONFIGURED_PATH
+        FFMPEG_CONFIGURED_PATH = self.ffmpeg_path_var.get().strip()
+        self.detect_ffmpeg(silent=True)
+
+        # Split mode
+        saved_split_mode = get("split_mode")
+        if saved_split_mode in SPLIT_MODE_OPTIONS:
+            self.split_mode_var.set(saved_split_mode)
+        else:
+            # Sicurezza: nessuno split automatico come comportamento predefinito.
+            self.split_mode_var.set("Non splittare (file intero)")
+        if get("target") in TARGET_OPTIONS:
+            self.target_var.set(get("target"))
+        if get("auto_target") in AUTO_TARGET_OPTIONS:
+            self.auto_target_var.set(get("auto_target"))
+        if get("duration") in DURATION_OPTIONS:
+            self.duration_var.set(get("duration"))
+        if "custom_duration_sec" in data:
+            try:
+                self.custom_duration_sec_var.set(int(get("custom_duration_sec")))
+            except Exception:
+                pass
+        if get("parts_n") in PARTS_OPTIONS:
+            self.parts_n_var.set(get("parts_n"))
+
+        # Video
+        if get("codec") in CODEC_OPTIONS:
+            self.codec_var.set(get("codec"))
+        if get("encoder_preset") in PRESET_ENCODER_OPTIONS:
+            self.encoder_preset_var.set(get("encoder_preset"))
+        if get("nvenc_preset") in NVENC_PRESET_OPTIONS:
+            self.nvenc_preset_var.set(get("nvenc_preset"))
+        if get("tune") in TUNE_OPTIONS:
+            self.tune_var.set(get("tune"))
+        if get("resolution") in RESOLUTION_OPTIONS:
+            self.resolution_var.set(get("resolution"))
+        if get("fps") in FPS_OPTIONS:
+            self.fps_var.set(get("fps"))
+        if "video_bitrate_kbps" in data:
+            try:
+                v = int(get("video_bitrate_kbps"))
+                self.video_br_var.set(str(max(0, min(500000, v))))
+            except Exception:
+                pass
+        if "crf" in data:
+            try:
+                self.crf_var.set(max(0, min(51, int(get("crf")))))
+            except Exception:
+                pass
+        self.denoise.set(bool(get("denoise", False)))
+        self.deinterlace.set(bool(get("deinterlace", False)))
+        self.hdr_tonemap.set(bool(get("hdr_tonemap", False)))
+
+        # Audio
+        if get("audio_codec") in AUDIO_OPTIONS:
+            self.audio_var.set(get("audio_codec"))
+        if "audio_bitrate_kbps" in data:
+            try:
+                v = int(get("audio_bitrate_kbps"))
+                self.audio_br_var.set(str(max(0, min(10000, v))))
+            except Exception:
+                pass
+        self.loudnorm.set(bool(get("loudnorm", False)))
+
+        # Sub / container
+        if get("subtitle_mode") in SUBTITLE_OPTIONS:
+            self.subtitle_var.set(get("subtitle_mode"))
+        self.infer_no_sub.set(bool(get("infer_no_sub", True)))
+        if get("output_ext") in OUTPUT_EXT_OPTIONS:
+            self.output_ext_var.set(get("output_ext"))
+
+        # File
+        self.overwrite.set(bool(get("overwrite", False)))
+        self.skip_existing.set(bool(get("skip_existing", True)))
+        self.use_filename_as_title.set(bool(get("use_filename_as_title", True)))
+        self.copy_metadata.set(bool(get("copy_metadata", True)))
+        self.static_title_var.set(get("static_title", ""))
+        self.static_artist_var.set(get("static_artist", ""))
+        self.static_album_var.set(get("static_album", ""))
+        self.static_genre_var.set(get("static_genre", ""))
+        self.static_comment_var.set(get("static_comment", ""))
+        self.static_year_var.set(get("static_year", ""))
+        self.static_logo_enabled.set(bool(get("static_logo_enabled", False)))
+        self.static_logo_path.set(get("static_logo_path", ""))
+        if get("static_logo_position"):
+            self.static_logo_position.set(get("static_logo_position"))
+        try:
+            self.static_logo_size.set(max(3, min(40, int(get("static_logo_size", 12)))))
+            self.static_logo_opacity.set(max(10, min(100, int(get("static_logo_opacity", 100)))))
+        except Exception:
+            pass
+        self.opt_pix_fmt_yuv420p.set(bool(get("opt_pix_fmt_yuv420p", False)))
+        self.opt_movflags_faststart.set(bool(get("opt_movflags_faststart", False)))
+
+        # Delete / trash
+        self.delete_input_after.set(bool(get("delete_input_after", False)))
+        if get("delete_mode"):
+            self.delete_mode_var.set(get("delete_mode"))
+        if get("custom_trash_dir"):
+            self.custom_trash_dir.set(get("custom_trash_dir"))
+
+        # Performance
+        self.auto_workers.set(bool(get("auto_workers", False)))
+        if "parallel_workers" in data:
+            try:
+                self.parallel_workers.set(max(1, min(16, int(get("parallel_workers")))))
+            except Exception:
+                pass
+        if get("threads") in THREADS_OPTIONS:
+            self.threads_var.set(get("threads"))
+        if get("priority") in PRIORITY_OPTIONS:
+            self.priority_var.set(get("priority"))
+        self.fallback_nvenc.set(bool(get("fallback_nvenc", True)))
+        self.check_disk_space.set(bool(get("check_disk_space", True)))
+
+        # Rinomina
+        if get("rename_part") in RENAME_PART_OPTIONS:
+            self.rename_part_var.set(get("rename_part"))
+        if get("rename_custom_template"):
+            self.rename_custom_template.set(get("rename_custom_template"))
+
+        # Extra
+        self.set_extra_args_text(str(get("extra_ffmpeg_args", "")))
+
+        # Log
+        self.save_log_csv.set(bool(get("save_log_csv", True)))
+        self.save_log_json.set(bool(get("save_log_json", False)))
+        self.notify_desktop.set(bool(get("notify_desktop", PLYER_OK)))
+
+        # Persistenza
+        self.autoload_settings.set(bool(get("autoload_settings", True)))
+        self.autosave_settings.set(bool(get("autosave_settings", True)))
+        self.settings_auto_backup.set(bool(get("settings_auto_backup", True)))
+        self.settings_validate_on_apply.set(bool(get("settings_validate_on_apply", True)))
+
+        # v1.1 queue / resume / verification / smart
+        self.resume_enabled.set(bool(get("resume_enabled", True)))
+        self.verify_output.set(bool(get("verify_output", True)))
+        try: self.verify_duration_tolerance.set(float(get("verify_duration_tolerance", 3.0)))
+        except Exception: pass
+        self.retry_enabled.set(bool(get("retry_enabled", True)))
+        try: self.max_retries.set(max(0, min(10, int(get("max_retries", 2)))))
+        except Exception: pass
+        self.smart_encode.set(bool(get("smart_encode", False)))
+        if get("smart_profile") in SMART_PROFILES: self.smart_profile_var.set(get("smart_profile"))
+        self.preferred_languages_var.set(str(get("preferred_languages", "ita,eng")))
+        self.generate_hash.set(bool(get("generate_hash", False)))
+        self.protect_input.set(bool(get("protect_input", True)))
+        self.auto_start_queue.set(bool(get("auto_start_queue", False)))
+
+        # Retrocompatibilità: vecchie chiavi v1.14
+        if get("video_bitrate_kbps") is None and "video_bitrate_kbps" not in data:
+            pass
+
+        # Aggiorna stati widget
+        self.on_codec_change()
+        self.on_audio_change()
+        self.on_split_mode_change()
+        self.on_auto_target_change()
+        self.on_duration_change()
+        self.on_rename_change()
+        self.on_delete_mode_change()
+        self.on_output_ext_change()
+        self.on_auto_workers_change()
+
+    # =================================================================
+    # ===== CHIUSURA ==================================================
+    # =================================================================
+    def on_close(self):
+        if self.running:
+            if not messagebox.askyesno(
+                "Operazione in corso",
+                "Un'operazione è in corso. Terminare comunque?"
+            ):
+                return
+            self.cancel_event.set()
+            self.pause_event.set()
+
+        self._persist_queue_silent()
+        if self.autosave_settings.get():
+            try:
+                self.save_settings(DEFAULT_SETTINGS_FILE, silent=True)
+            except Exception as e:
+                print(f"Autosave fallito: {e}")
+
+        self.destroy()
+
+
+# =====================================================================
+# ===== ENTRYPOINT ====================================================
+# =====================================================================
+def _install_global_exception_hook(app):
+    """Intercetta eccezioni non gestite e le passa al motore AI."""
+    old_hook = sys.excepthook
+    def hook(exc_type, exc_value, exc_tb):
+        try:
+            import traceback as _tb
+            text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+            if getattr(app, "ai_enabled", None) and app.ai_enabled.get():
+                app._ai_write("\n══ ERRORE PYTHON ══\n" + text)
+                app.ai_last_error = {"time": datetime.now().isoformat(timespec="seconds"),
+                                     "source": "python", "part": None, "cmd": [],
+                                     "rc": -1, "stderr": text,
+                                     "plan": app._ai_plan_fix(text)}
+                app.ai_status_var.set("AI: eccezione Python intercettata")
+                app._ai_record("intercettazione eccezione Python", "ok", type(exc_value).__name__)
+        except Exception:
+            pass
+        try:
+            old_hook(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
+def main():
+    try:
+        app = App()
+        _install_global_exception_hook(app)
+        app.mainloop()
+    except Exception:
+        # Avvio silenzioso: niente popup "Errore fatale".
+        # L'errore viene comunque lasciato disponibile sullo stderr per il debug.
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
