@@ -1,660 +1,229 @@
-# 🎬 Naplex Prime — FFmpeg GUI Ultimate
-
-**Versione:** v1.2 AI Auto-Fix
-**Data:** 15/09/2026
-
-GUI avanzata in **Python + Tkinter** per gestire FFmpeg con funzioni di analisi, encoding, splitting, verifica automatica, gestione code, organizzazione dei file multimediali e recupero dagli errori.
-
-L'obiettivo è offrire un frontend completo per FFmpeg, automatizzando il flusso:
-
-**Analisi → Configurazione → Encoding / Split → Verifica → Retry / Recovery → Organizzazione → Logging**
-
----
-
-## ✨ Funzionalità principali
-
-### ✂️ Split intelligente
-
-Supporta diversi metodi di suddivisione:
-
-* Split per dimensione
-* Split per durata
-* Split in N parti uguali
-* Split tramite capitoli
-* Nessuno split
-
-### 📦 Target automatici
-
-Preset per dimensioni comuni:
-
-* Telegram Standard — 1.95 GiB
-* Telegram Premium — 3.95 GiB
-* FAT32 — 3.95 GiB
-* DVD5 — 4.36 GiB
-* DVD9 — 7.95 GiB
-* Blu-ray — 24 GiB
-* Google Drive — 4.9 GiB
-* Target personalizzato
-
-Sono inoltre disponibili target manuali da **2000 MB a 4000 MB**.
-
----
-
-## 🎞️ Encoding video
-
-Supporto ai principali encoder FFmpeg:
-
-* `Copy` — nessun re-encode
-* H.264 — `libx264`
-* H.265 — `libx265`
-* H.264 — NVIDIA NVENC
-* H.265 — NVIDIA NVENC
-* H.264 — Intel QSV
-* H.265 — Intel QSV
-* H.264 — AMD AMF
-* H.265 — AMD AMF
-
-### 🔄 GPU Fallback
-
-Se un encoder hardware non è disponibile, il programma può effettuare automaticamente il fallback verso l'encoding CPU:
-
-```text
-NVENC / QSV / AMF
-        ↓
-   CPU fallback
-        ↓
-libx264 / libx265
-```
-
----
-
-## 🎵 Audio
-
-Possibilità di:
-
-* Copiare l'audio originale
-* Rimuovere l'audio
-* AAC
-* AC3
-* E-AC3
-* MP3
-* Opus
-* FLAC Lossless
-
----
-
-## 🖥️ Risoluzione e FPS
-
-### Risoluzioni
-
-* Originale
-* 2160p
-* 1440p
-* 1080p
-* 720p
-* 480p
-* 360p
-
-### Frame rate
-
-* Originale
-* 60 FPS
-* 50 FPS
-* 30 FPS
-* 25 FPS
-* 24 FPS
-* 23.976 FPS
-
----
-
-## 💬 Sottotitoli
-
-Gestione dei sottotitoli con diverse modalità:
-
-* Copy
-* Nessun sottotitolo
-* Solo forced
-* Escludi forced
-* Burn-in
-
-Il programma analizza automaticamente gli stream tramite `ffprobe` e può rilevare i sottotitoli forced.
-
----
-
-## 📺 Organizzazione automatica
-
-Supporto per la gestione automatica della struttura delle librerie multimediali:
-
-* Plex
-* Jellyfin
-* Kodi
-* Film
-* Serie TV
-
-Esempio:
-
-```text
-Show (Year)/
-└── Season 01/
-    ├── Show - S01E01.mkv
-    ├── Show - S01E02.mkv
-    └── Show - S01E03.mkv
-```
-
-Sono disponibili strutture:
-
-* Flat
-* Plex
-* Jellyfin
-* Kodi
-* Movie
-
----
-
-## 🏷️ Rinomina automatica
-
-Template disponibili:
-
-```text
-.part001
-Part 01 of 05
-Show - S01E01 - Part 1
-001
-Custom Template
-```
-
-Il parser riconosce diversi formati di naming delle serie, tra cui:
-
-```text
-Show S01E01
-Show 1x01
-Show (2024) S01E01
-```
-
-e i film con formato:
-
-```text
-Movie (2024)
-```
-
----
-
-## 🧠 Smart Encode
-
-Profili automatici disponibili:
-
-### Smart
-
-Selezione conservativa del codec e della modalità in base al file sorgente.
-
-### Archivio
-
-* H.265 CPU
-* Alta qualità
-* Audio originale
-* Verifica del risultato
-
-### Velocità
-
-Profilo ottimizzato per ridurre i tempi di elaborazione.
-
-### TV
-
-* H.264
-* 1080p
-* `yuv420p`
-* AAC
-
-### Compressione
-
-H.265 con impostazioni orientate alla riduzione delle dimensioni.
-
----
-
-## 🤖 AI Auto-Fix
-
-Sistema automatico di analisi e recupero dagli errori FFmpeg.
-
-Può utilizzare:
-
-* Analisi degli errori
-* Retry automatico
-* Configurazione automatica
-* Safe Mode
-* Storico degli errori
-* Backup del sorgente
-* Conteggio dei fix
-
-Il sistema include diagnostica per errori come:
-
-* Encoder non disponibile
-* Decoder non disponibile
-* NVENC non disponibile
-* Memoria GPU esaurita
-* File inesistente
-* Permessi negati
-* Disco pieno
-* File corrotto/incompleto
-* Errori di scrittura
-* Incompatibilità codec/muxer
-* Parametri non validi
-* Errori relativi a filtri e sottotitoli
-* Problemi di timestamp
-* Pixel format non supportato
-
----
-
-## 📋 Coda di elaborazione
-
-Gestione avanzata dei job:
-
-* Coda persistente
-* Riordinamento dei job
-* Salvataggio/caricamento JSON
-* Resume
-* Recovery queue
-* Retry automatico
-* Pausa tra le parti
-* Avvio automatico della coda
-* Skip dei file già completati
-
-La coda viene salvata in:
-
-```text
-~/.ffmpeg_split_gui_queue.json
-```
-
----
-
-## ✅ Verifica automatica
-
-Al termine dell'elaborazione il programma può verificare automaticamente l'output tramite `ffprobe`.
-
-Sono disponibili:
-
-* Verifica del file prodotto
-* Verifica durata
-* Verifica stream
-* Verifica metadata
-* SHA-256 opzionale
-* Protezione del file sorgente
-* Recovery in caso di errore
-
-Il file originale viene elaborato solo dopo aver completato i controlli previsti.
-
----
-
-## 📊 Monitoraggio in tempo reale
-
-Durante l'elaborazione vengono mostrati:
-
-* Percentuale
-* Tempo di output
-* ETA
-* FPS
-* Speed
-* File corrente
-* CPU
-* GPU
-* RAM
-* Progress bar
-
-Il progresso viene ottenuto tramite:
-
-```text
--progress pipe:1
-```
-
----
-
-## 💾 Gestione spazio disco
-
-Prima dell'elaborazione può essere effettuato un controllo dello spazio disponibile per evitare errori dovuti a disco pieno.
-
----
-
-## 🗑️ Protezione e cestino
-
-La cancellazione dei file può utilizzare il cestino di sistema tramite `send2trash`.
-
-Quando non disponibile viene utilizzata una directory:
-
-```text
-_TRASH
-```
-
-con gestione automatica dei conflitti di nome.
-
----
-
-## ⚙️ Gestione FFmpeg
-
-Il programma include un **FFmpeg Manager** con:
-
-* Ricerca automatica di FFmpeg
-* Ricerca di FFprobe
-* Supporto al `PATH`
-* Percorsi statici Windows
-* Percorso FFmpeg personalizzato
-* Supporto a cartelle portable
-* Diagnostica del percorso
-* Download tramite sito ufficiale FFmpeg
-* Console CMD nascosta durante l'esecuzione su Windows
-
-FFmpeg deve essere disponibile nel `PATH` oppure configurato manualmente.
-
----
-
-## 🔧 Preset Encoder
-
-### x264 / x265
-
-Supporto ai preset:
-
-```text
-ultrafast
-superfast
-veryfast
-faster
-fast
-medium
-slow
-slower
-veryslow
-```
-
-### NVENC
-
-Preset:
-
-```text
-p1 → p7
-```
-
-### Tune
-
-Supporto a:
-
-```text
-film
-animation
-grain
-stillimage
-fastdecode
-zerolatency
-```
-
----
-
-## 🧵 Gestione risorse
-
-Configurazione dei thread:
-
-```text
-Auto
-1
-2
-4
-6
-8
-12
-16
-24
-32
-```
-
-Priorità processo:
-
-```text
-Normal
-Below Normal
-Low
-Idle
-```
-
-Il programma può inoltre utilizzare `psutil` per monitorare e gestire le risorse del sistema.
-
----
-
-## 📝 Logging
-
-Generazione di log delle operazioni in formato:
-
-* CSV
-* JSON
-
-Il log può contenere informazioni come:
-
-```text
-timestamp
-input
-output
-part number
-duration
-size
-codec
-resolution
-fps
-split mode
-status
-verified
-sha256
-elapsed
-speed
-error
-```
-
----
-
-## 📤 Export comandi FFmpeg
-
-È possibile esportare i comandi generati nei formati:
-
-```text
-.sh
-.bat
-```
-
-utile per eseguire successivamente le operazioni anche senza la GUI.
-
----
-
-## 🧰 Utility
-
-Il progetto include strumenti per:
-
-* Quick Media Info
-* Analisi tramite ffprobe
-* Pulizia file temporanei
-* Diagnostica
-* Copia diagnostica
-* Analisi encoder disponibili
-* Analisi filtri disponibili
-
----
-
-## 💾 Preset e configurazione
-
-Sono supportati fino a **5 preset nominati**.
-
-Le impostazioni vengono salvate in:
-
-```text
-~/.ffmpeg_split_gui.json
-```
-
-Sono inoltre previste funzioni di:
-
-* Auto-save
-* Auto-load
-* Backup delle impostazioni
-* Validazione della configurazione
-* Compatibilità con impostazioni precedenti
-
----
-
-## 🎨 Interfaccia
-
-L'interfaccia è organizzata in più sezioni:
-
-* **Principale**
-* **File & Output**
-* **Video & Audio**
-* **Split**
-* **Utility**
-* **AI Auto-Fix**
-* **Coda e Log**
-
-La barra inferiore mostra:
-
-```text
-File corrente
-Speed
-ETA
-CPU
-GPU
-RAM
-Progress
-```
-
-Sono inoltre disponibili i comandi principali:
-
-```text
-Scan
-Start Encoding
-Cancel
-Pause
-Open Output
-Clear Log
-```
-
----
-
-## 📁 Formati video supportati
-
-### Input
-
-```text
-.mkv
-.mp4
-.m4v
-.mov
-.avi
-.ts
-.m2ts
-.mts
-.webm
-.flv
-.wmv
-.mpg
-.mpeg
-.vob
-```
-
-### Output
-
-```text
-.mkv
-.mp4
-.m4v
-.ts
-.mov
-.avi
-.webm
-```
-
----
-
-## 📦 Dipendenze
-
-Il programma utilizza:
-
-* Python 3
-* FFmpeg
-* FFprobe
-
-Dipendenze Python opzionali:
-
-```text
-send2trash
-plyer
-psutil
-```
-
-Installazione:
-
-```bash
-pip install send2trash plyer psutil
-```
-
----
-
-## 🚀 Avvio
-
-Assicurarsi che `ffmpeg` e `ffprobe` siano disponibili nel `PATH`.
-
-Esempio:
-
-```bash
-python ffmpeg_split_gui.py
-```
-
-Su Windows è possibile configurare manualmente il percorso di FFmpeg tramite **FFmpeg Manager**.
-
----
-
-## 🖥️ Piattaforme
-
-Il progetto è pensato per funzionare con FFmpeg su sistemi desktop, con gestione specifica anche per Windows, inclusi:
-
-* Ricerca automatica di FFmpeg
-* Percorsi statici
-* FFmpeg portable
-* Console nascosta
-* Export `.bat`
-
----
-
-## 🔐 Affidabilità
-
-Il progetto integra diversi meccanismi per ridurre il rischio di perdita o produzione di file incompleti:
-
-* Verifica post-elaborazione
-* SHA-256 opzionale
-* Backup sorgente
-* Recovery queue
-* Retry automatico
-* Disk-space check
-* Protezione input
-* Gestione del cestino
-* Diagnostica FFmpeg
-* Fallback encoder
-* Resume dei job completati
-
----
-
-## 📌 Stato del progetto
-
-**Naplex Prime — FFmpeg GUI Ultimate v1.2 AI Auto-Fix**
-
-Frontend completo per FFmpeg orientato a:
-
-> **Splitting · Encoding · Conversion · Verification · Recovery · Automation · Media Organization**
-
----
-
-## ⚠️ Requisiti
-
-Prima dell'utilizzo verificare:
-
-1. Python 3 installato
-2. FFmpeg installato
-3. FFprobe disponibile
-4. Spazio disco sufficiente per gli output
-5. Driver GPU corretti se si utilizzano encoder hardware
-
----
-
-
-
-oppure specificare la licenza effettivamente utilizzata dal repository.
+# Naplex Prime — Report aggiornato delle funzionalità
+
+**Data:** 28 settembre 2026  
+**Creatore indicato nel sorgente:** naplex19 / naplex 19  
+**Versione applicativa:** 1.6 AI Error Center – Clean UI, con aggiornamenti recenti.
+
+## 1. Novità aggiunte
+
+### Scheda “Guida e Creatore”
+Nuova scheda dedicata alla documentazione del programma, con:
+
+- Istruzioni per iniziare a elaborare un video.
+- Descrizione delle sezioni e delle funzioni disponibili.
+- Ricerca per parola chiave nella guida.
+- Pulsante “Mostra tutto” per ripristinare il contenuto completo.
+- Pulsante per copiare tutta la guida negli appunti.
+- Elenco delle scorciatoie da tastiera.
+- Crediti del creatore **naplex19**.
+- Riconoscimenti a Python, Tkinter, FFmpeg e VLC.
+- Accesso anche dal menu **Aiuto → Guida e Creatore**.
+
+Non sono stati inventati biografia, contatti o informazioni personali del creatore.
+
+## 2. Correzioni recenti
+
+| Problema individuato | Modifica apportata |
+|---|---|
+| Possibili collisioni dei file temporanei tra elaborazioni parallele | Ogni temporaneo riceve un identificatore univoco. |
+| Retry audio AAC senza un secondo tentativo nelle modalità diverse dallo split per dimensione | Aumentati i tentativi disponibili per consentire il fallback. |
+| Riferimenti a temporanei già eliminati quando il limite di dimensione non viene raggiunto | Azzerati i riferimenti e aggiunto un messaggio di errore specifico. |
+| Timecode numerici come `nan` e `inf` accettati dal parser | Rifiutati i valori non finiti. |
+| Caricamento manuale di una coda durante l’elaborazione | Bloccata la sostituzione della coda mentre l’encoding è attivo. |
+
+## 3. Funzioni precedenti mantenute
+
+### Dashboard e gestione dei file
+- Dashboard principale con riepilogo e comandi di elaborazione.
+- Inserimento di un file singolo o di più file.
+- Scansione di cartelle, anche ricorsiva.
+- Filtro dei file superiori a 4 GiB.
+- Drag & drop tramite la dipendenza opzionale `tkinterdnd2`.
+- Inventario delle tracce video, audio e sottotitoli.
+- Visualizzazione delle informazioni tecniche del file selezionato.
+- Apertura delle cartelle sorgente, output e log.
+
+### Output e organizzazione
+- Selezione di una o più cartelle di destinazione.
+- Scelta del contenitore di output o mantenimento dell’estensione sorgente.
+- Rinomina delle parti con schemi predefiniti o personalizzati.
+- Riconoscimento di nomi di film e serie TV.
+- Organizzazione delle cartelle per Plex, Jellyfin e Kodi.
+- Opzioni di sovrascrittura.
+- Gestione del sorgente dopo l’elaborazione secondo le impostazioni.
+- Supporto al cestino di sistema o a una cartella di raccolta.
+
+### Elaborazione video
+- Copia del video senza ricodifica.
+- Codifica CPU H.264 e H.265.
+- Opzioni di codifica hardware NVIDIA, Intel e AMD.
+- Impostazione del bitrate video.
+- Modifica di risoluzione e frame rate.
+- Sovrimpressione di un logo.
+- Argomenti FFmpeg personalizzati.
+- Fallback da encoder hardware a CPU.
+- Controllo degli encoder disponibili.
+
+La disponibilità della codifica hardware dipende da GPU, driver e versione di FFmpeg.
+
+### Audio, sottotitoli e tracce
+- Copia o conversione dell’audio.
+- Impostazione del bitrate audio.
+- Gestione dei sottotitoli secondo le opzioni disponibili.
+- Rilevamento delle tracce sottotitoli e dei sottotitoli forzati.
+- Manager MAP per scegliere le tracce da includere.
+- Selezione di tutte le tracce, per tipo, oppure azzeramento della selezione.
+- Tentativo di conversione audio in AAC in alcuni casi di incompatibilità con il contenitore.
+
+### Split e timeline
+- Elaborazione del file intero.
+- Divisione per dimensione.
+- Divisione per durata fissa.
+- Divisione in un numero prestabilito di parti.
+- Divisione per capitoli.
+- Estrazione di un singolo intervallo.
+- Impostazione del punto iniziale e della durata da elaborare.
+- Estensione dell’intervallo fino alla fine del video.
+- Lettura della durata del sorgente.
+- Riepilogo dell’intervallo e anteprima del piano di divisione.
+- Timecode in secondi, `MM:SS` e `HH:MM:SS.mmm`.
+- Target preimpostati per Telegram, FAT32, DVD, Blu-ray e altri limiti di dimensione.
+
+In modalità copia, la precisione dei tagli può dipendere dai fotogrammi chiave.
+
+### Coda di elaborazione
+- Coda persistente con salvataggio e caricamento JSON.
+- Aggiunta, rimozione e riordino dei job.
+- Svuotamento della coda e rimozione dei completati.
+- Ricoda dei job selezionati.
+- Retry dei job falliti.
+- Ripresa delle parti registrate come completate.
+- Pausa e ripresa tra le parti.
+- Annullamento dell’elaborazione.
+- Copia del percorso o dell’errore del job.
+- Apertura della posizione del file selezionato.
+
+### Avanzamento e risorse
+- Percentuale di avanzamento per job e per parte.
+- Riepilogo dell’avanzamento globale.
+- Velocità, FPS, tempo trascorso e tempo residuo stimato.
+- Numero di worker automatico o configurabile.
+- Limite dei thread FFmpeg.
+- Priorità del processo.
+- Monitor CPU, RAM e GPU quando disponibili.
+
+### Verifiche e integrità
+- Controllo dello spazio disponibile.
+- Pre-flight check della configurazione.
+- Dry-run per esaminare l’elaborazione prevista.
+- Verifica degli output con ffprobe, se abilitata.
+- Controllo della durata con tolleranza configurabile.
+- Generazione opzionale di hash SHA-256.
+- Controllo di integrità mediante decodifica audio/video.
+- Protezioni sulla gestione finale del sorgente legate all’esito dell’elaborazione e alle opzioni attivate.
+
+### Lettore VLC
+- Lettore video incorporato nell’interfaccia.
+- Apertura di un file o caricamento della selezione.
+- Play, pausa e stop.
+- Salti avanti e indietro di 10 secondi.
+- Spostamento nella timeline.
+- Volume e mute.
+- Velocità di riproduzione.
+- Snapshot.
+- Schermo intero.
+
+Richiede VLC e il collegamento Python appropriato.
+
+### Utility multimediali
+- Informazioni tecniche rapide sui media.
+- Esportazione dell’inventario in CSV o JSON.
+- Estrazione di un’anteprima JPG al timecode impostato.
+- Analisi del file selezionato.
+- Statistiche della sessione.
+- Pulizia dei temporanei.
+- Salvataggio del report di sessione.
+
+### FFmpeg Manager
+- Rilevamento di FFmpeg e ffprobe.
+- Ricerca nel PATH e nei percorsi Windows previsti.
+- Configurazione di un percorso personalizzato.
+- Test dell’installazione.
+- Diagnostica di encoder e filtri.
+- Benchmark del codec selezionato.
+- Copia ed esportazione della diagnostica.
+- Accesso alla pagina ufficiale per il download.
+- Esecuzione senza finestre console FFmpeg su Windows.
+
+### Preset, impostazioni e interfaccia
+- Preset nominati, fino al limite previsto di cinque.
+- Salvataggio, caricamento ed eliminazione dei preset.
+- Salvataggio e caricamento delle impostazioni.
+- Validazione, riepilogo e ripristino dei valori predefiniti.
+- Backup delle impostazioni.
+- Temi grafici selezionabili.
+- Schede con contenuti scorrevoli.
+- Menu File, Elaborazione, Lettore, Strumenti, AI e Aiuto.
+- Interfaccia Clean UI con etichette prevalentemente testuali.
+- Notifiche desktop opzionali.
+
+### AI Error Center
+- Raccolta centralizzata degli errori Python, Tkinter, thread, FFmpeg e delle integrazioni gestite.
+- Storico e contatore degli errori.
+- Indicazione di origine, categoria, causa probabile e suggerimenti.
+- Analisi dell’ultimo errore.
+- Applicazione delle correzioni previste dalle regole interne.
+- Opzioni di retry e riparazione della configurazione.
+- Test dell’ambiente.
+- Backup del sorgente previsto dalla modalità sicura.
+
+**Il centro utilizza regole locali di diagnosi: non è una chat collegata a un modello AI remoto.**
+
+### Log ed esportazione comandi
+- Log delle operazioni.
+- Esportazione CSV e JSON.
+- Report diagnostici e di sessione.
+- Esportazione dei comandi come script Windows `.bat` e Unix `.sh`.
+- Copia dei comandi negli appunti.
+- Generazione dei comandi coerente con il piano di split.
+
+## 4. Scorciatoie principali
+
+| Scorciatoia | Azione |
+|---|---|
+| Ctrl+O | Apri un file nel lettore |
+| Ctrl+Shift+O | Seleziona la cartella sorgente |
+| Ctrl+I | Inserisci un file singolo |
+| Ctrl+S | Salva le impostazioni |
+| F5 | Scansiona |
+| F9 | Avvia encoding |
+| Ctrl+Q | Esci |
+
+## 5. Pacchetti aggiornati
+
+| Pacchetto | Contenuto e requisiti |
+|---|---|
+| **Windows — Naplex Prime 1.6.1.exe** | Sorgente aggiornato confezionato con Python e Tkinter. FFmpeg/ffprobe restano da installare o configurare. Le integrazioni opzionali non sono incluse in questa compilazione. |
+| **Debian/Ubuntu — naplex-prime_7.0+guide1_all.deb** | Sorgente aggiornato, lanciatore e voce nel menu applicazioni. Dichiara Python, Tkinter e FFmpeg come dipendenze. |
+
+La numerazione Debian `7.0+guide1` serve a consentire l’aggiornamento del precedente pacchetto `7.0`. Il sorgente continua a riportare la versione applicativa **1.6 AI Error Center – Clean UI**.
+
+## 6. Stato delle verifiche
+
+**Controlli completati:**
+- Sintassi Python del sorgente.
+- Otto casi di validazione dei timecode.
+- Costruzione della guida con componenti grafici simulati.
+- Compilazione dell’EXE con PyInstaller.
+- Struttura del DEB, permessi del lanciatore e corrispondenza del sorgente incluso.
+- Generazione dei checksum SHA-256 dei pacchetti.
+- Copia di backup prima dell’aggiornamento del sorgente originale.
+
+**Non ancora verificati:**
+- Aspetto e interazione della finestra reale dopo l’aggiornamento.
+- Installazione e avvio su Debian/Ubuntu.
+- Conversioni complete con diversi codec e contenitori.
+- Funzionamento dei fallback e delle elaborazioni parallele su file reali.
+- Integrazioni opzionali nei diversi ambienti.
+
+Il report descrive le funzionalità presenti nel codice; non equivale a un collaudo completo di ogni funzione.
